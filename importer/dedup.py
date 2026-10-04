@@ -18,6 +18,7 @@ L2/L3 之所以只标记不删：跨渠道的同一笔支出（支付宝扣款 +
 
 from __future__ import annotations
 
+import datetime as dt
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from typing import Literal, Optional
@@ -27,6 +28,24 @@ from .model import SOURCE_LABELS, Txn, normalize_text
 
 def _label(source: str) -> str:
     return SOURCE_LABELS.get(source, source)
+
+
+def _row_ts(row) -> dt.datetime:
+    """从库里取出的记录拿到 datetime。
+
+    库里 ts 存的是 'YYYY-MM-DD HH:MM:SS' 字符串。
+    以前这里写的是 row["ts_dt"] —— 那个键**从来就不存在**，
+    于是 L3 每次执行都抛 IndexError，整整一层去重是坏的。
+
+    坏得还很隐蔽：只有「走到 L3」才会触发。fixtures 在 L2 就 return 了，
+    金额互不相同的样本也走不到 L3，所以测试全绿、真实数据一跑就崩。
+
+    现在统一从 "ts" 解析，不依赖任何人往行里塞额外的键。
+    """
+    value = row["ts"]
+    if isinstance(value, dt.datetime):
+        return value
+    return dt.datetime.fromisoformat(value)
 
 Verdict = Literal["new", "identical", "suspect_exact", "suspect_near"]
 
@@ -100,7 +119,7 @@ def classify(txn: Txn, ledger) -> DedupResult:
     for hit in ledger.near(txn.ts, txn.amount, NEAR_WINDOW_SECONDS):
         ratio = _similarity(txn.counterparty, hit["counterparty"])
         if ratio >= NEAR_RATIO_THRESHOLD:
-            delta = abs((txn.ts - hit["ts_dt"]).total_seconds())
+            delta = abs((txn.ts - _row_ts(hit)).total_seconds())
             return DedupResult(
                 verdict="suspect_near",
                 reason=(
