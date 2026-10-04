@@ -196,6 +196,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
     months: set = set()
     ok_count = 0
     fail: list = []
+    partial: list = []
 
     # 一次运行内的密码只存在内存里：同一个渠道的多个 zip 不必重复输入，
     # 但运行一结束就随进程一起消失，不落任何盘。
@@ -255,14 +256,31 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                 continue
 
             if not outcome.ok:
-                print(f"  未导入：{outcome.error}")
-                print("  文件留在原地，不会丢。")
-                fail.append((path, outcome.error))
+                # 部分失败和彻底失败必须分开说。
+                # 两者都让文件留在原地，但「未导入」这四个字会让人以为一条都没写进去，
+                # 转头就去检查文件、甚至重新导一遍 —— 而实际上库里已经有几笔了。
+                print(f"  本批未完成：{outcome.status_label}")
+                if outcome.error:
+                    print(f"  原因：{outcome.error}")
+                if outcome.status == "partial_failed":
+                    print(f"  ！已写入 {outcome.inserted} 笔、失败 {len(outcome.failed_rows)} 笔，"
+                          f"源文件不会被归档。")
+                    print("     补完问题后再跑一次即可：已入库的会自动跳过（按单号/指纹去重），"
+                          "失败的那几笔会补上。")
+                    partial.append((path, outcome.error))
+                else:
+                    print("  一笔都没有写入。文件留在原地，不会丢。")
+                    fail.append((path, outcome.error))
                 continue
 
             ok_count += 1
             months |= outcome.months
 
+            # 归档条件只有一个：outcome.archivable，也就是这一批全部写入成功。
+            #
+            # 刻意不用 `not outcome.ok` 反推：dry_run 的 ok 也是真，但它不该动文件。
+            # 「成功」和「可以归档」写成两件事，以后再加状态时不会互相带偏 ——
+            # 而这里恰恰是全流程唯一真正动文件的地方，条件写错就是漏记。
             if dry_run:
                 print("  [dry-run] 文件未移动。")
             elif keep:
@@ -312,7 +330,11 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
 
     print()
     print("=" * 72)
-    print(f"本次处理：成功 {ok_count} 个，失败 {len(fail)} 个")
+    print(f"本次处理：成功 {ok_count} 个，部分失败 {len(partial)} 个，失败 {len(fail)} 个")
+    if partial:
+        print("部分失败（已入库一部分，文件留在原地等重试）：")
+        for path, reason in partial:
+            print(f"  {os.path.basename(path)} —— {reason}")
     if fail:
         print("失败清单（文件都还在原地）：")
         for path, reason in fail:
@@ -325,4 +347,4 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             print(f"有 {suspects} 笔疑似重复等你确认。用大按钮界面最快：")
         print("  python -m importer review --ui")
 
-    return 0 if not fail else 2
+    return 0 if not fail and not partial else 2
