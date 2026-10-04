@@ -186,13 +186,19 @@ def ai_classify(merchants: list[str], url: str = DEFAULT_AI_URL,
 # --------------------------------------------------------------------------
 
 def _apply_non_consumption(txns) -> int:
-    """把落在「非消费」分类里的交易，方向压成中性。返回改动笔数。
+    """把落在「非消费」分类里的**支出**压成中性。返回改动笔数。
 
     必须在分类之后做 —— 方向是解析时定的，那时还不知道分类。
+
+    **只对支出生效，收入一律保留。**
+    理由：家里给的生活费、朋友还的钱，在平台里都表现为「转账」进账，
+    它们归到「转账还款」分类，但那是真金白银进来的，必须算收入。
+    只有支出一侧才存在「钱在自己账户之间搬」这种假消费。
     """
     changed = 0
     for txn in txns:
-        if txn.category in NON_CONSUMPTION_CATEGORIES and txn.direction != DIRECTION_NEUTRAL:
+        if (txn.category in NON_CONSUMPTION_CATEGORIES
+                and txn.direction == DIRECTION_EXPENSE):
             txn.direction = DIRECTION_NEUTRAL
             changed += 1
     return changed

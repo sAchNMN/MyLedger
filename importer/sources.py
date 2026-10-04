@@ -170,6 +170,7 @@ def _parse_rows(
                 "编码": encoding,
                 "表头行": header_row + 1,
                 "数据行": row_no + 1,
+                "方向列": cell(row, index, "direction"),   # 供 fixups 重推方向用
                 "原始": row,
             },
         ))
