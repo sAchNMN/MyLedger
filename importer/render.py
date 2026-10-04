@@ -1,0 +1,93 @@
+"""终端输出排版与报表渲染。
+
+单独抽出来是因为 cli 和 monthly 都要出报表，
+而 monthly 被 cli 调用——如果报表逻辑留在 cli 里就成了循环依赖。
+"""
+
+from __future__ import annotations
+
+import unicodedata
+from decimal import Decimal
+
+from .model import DIRECTION_EXPENSE, DIRECTION_INCOME, DIRECTION_NEUTRAL
+
+
+def width(text) -> int:
+    """按终端显示宽度算长度：中日韩全角字符占 2 列。"""
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in str(text))
+
+
+def pad(text, target: int, align: str = "left") -> str:
+    text = str(text)
+    space = max(0, target - width(text))
+    if align == "right":
+        return " " * space + text
+    return text + " " * space
+
+
+def table(headers: list, rows: list, aligns: list | None = None) -> str:
+    aligns = aligns or ["left"] * len(headers)
+    widths = [width(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], width(cell))
+    lines = ["  ".join(pad(h, widths[i]) for i, h in enumerate(headers))]
+    lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        lines.append("  ".join(pad(c, widths[i], aligns[i]) for i, c in enumerate(row)))
+    return "\n".join(lines)
+
+
+def money(value) -> str:
+    return f"{Decimal(str(value or 0)):,.2f}"
+
+
+def print_overview(ledger, db_path: str = "") -> None:
+    overall = ledger.overall()
+    txn = overall["txn"]
+    print("=" * 72)
+    print(f"账本概览    {db_path}" if db_path else "账本概览")
+    print(f"  交易总笔数 : {txn['n'] or 0}")
+    print(f"  时间范围   : {txn['first_ts'] or '-'} ~ {txn['last_ts'] or '-'}")
+    print(f"  导入批次   : {overall['batches']} 次")
+    print(f"  支出总额   : {money(txn['expense'])} 元")
+    if txn["suspect"]:
+        print(f"  待确认重复 : {txn['suspect']} 笔（用 review 处理）")
+    if txn["confirmed_dup"]:
+        print(f"  已确认重复 : {txn['confirmed_dup']} 笔（已从统计中剔除）")
+
+
+def print_month(ledger, month: str) -> None:
+    summary = ledger.month_summary(month)
+    print()
+    if not summary["rows"]:
+        print(f"{month} 没有数据。")
+        return
+
+    expense = [
+        (row["category"], Decimal(str(row["total"] or 0)), row["n"])
+        for row in summary["rows"] if row["direction"] == DIRECTION_EXPENSE
+    ]
+    income = [
+        Decimal(str(row["total"] or 0))
+        for row in summary["rows"] if row["direction"] == DIRECTION_INCOME
+    ]
+    neutral = [
+        Decimal(str(row["total"] or 0))
+        for row in summary["rows"] if row["direction"] == DIRECTION_NEUTRAL
+    ]
+
+    print(f"{month} 支出构成（已剔除确认重复）")
+    if expense:
+        expense.sort(key=lambda item: item[1], reverse=True)
+        total = sum(item[1] for item in expense)
+        rows = [[cat, money(amt), n] for cat, amt, n in expense]
+        rows.append(["合计", money(total), sum(n for _, _, n in expense)])
+        print(table(["分类", "金额(元)", "笔数"], rows, ["left", "right", "right"]))
+    else:
+        print("  （本月没有支出）")
+
+    if income:
+        print(f"\n  收入合计 {money(sum(income))} 元")
+    if neutral:
+        print(f"  中性交易（充值 / 提现 / 还款等）合计 {money(sum(neutral))} 元，不计入消费")

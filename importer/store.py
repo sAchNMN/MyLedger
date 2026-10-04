@@ -26,7 +26,6 @@ from .dedup import DedupResult, classify
 from .model import SOURCE_LABELS, Txn, normalize_text
 
 SCHEMA = """
-PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS batch (
@@ -97,18 +96,51 @@ def file_sha1(path: str) -> str:
 
 
 class Ledger:
-    """账本。所有写操作都经过去重判定。"""
+    """账本。所有写操作都经过去重判定。
 
-    def __init__(self, db_path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+    刻意接受一个已经建好的 sqlite 连接，而不是自己按路径打开：
+    加密存储（secure_store.py）需要把库整个装进内存操作，
+    最后再序列化加密落盘，明文一秒都不碰硬盘。
+    如果这里写死「按路径打开文件」，那条路就走不通了。
+    """
+
+    def __init__(self, conn: sqlite3.Connection, db_path: str = "",
+                 init_schema: bool = True):
+        self.conn = conn
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        if init_schema:
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
         self._batch_seen_keys: set[str] = set()
         self._batch_seen_fp: dict[str, str] = {}
         self.batch_id = ""
+
+    # ------------------------------------------------------------------
+    @classmethod
+    def open_plaintext(cls, db_path: str) -> "Ledger":
+        """明文库。只用于迁移旧数据和自动化测试，正常运行一律走加密存储。
+
+        刻意不启用 WAL：WAL 模式下 `serialize()` 出来的镜像头会带 WAL 标记，
+        装进内存库后会报「unable to open database file」（见 secure_store）。
+        明文库是过渡形态，不需要 WAL 带来的并发好处。
+        """
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode = DELETE")
+        return cls(conn, db_path)
+
+    def close(self) -> None:
+        try:
+            self.conn.commit()
+        finally:
+            self.conn.close()
+
+    def __enter__(self) -> "Ledger":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     # ------------------------------------------------------------------
     # 去重查询接口（dedup.classify 依赖这三个）
