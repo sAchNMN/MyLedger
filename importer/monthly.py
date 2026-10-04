@@ -37,7 +37,7 @@ import zipfile
 from datetime import datetime
 from typing import Optional
 
-from . import review_ui
+from . import review_ui, secure_store
 from .pipeline import import_file
 from .power import describe
 from .render import print_month, print_overview
@@ -292,6 +292,21 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             print()
             print("=" * 72)
             print(f"发现 {suspects} 笔疑似重复，直接打开确认界面。")
+
+            # 先把导入结果落盘，再开界面。
+            #
+            # open_encrypted 只在 with 退出时保存，而确认界面会一直阻塞到审完为止。
+            # 不先存一次的话，这段时间里账本文件还是旧内容 —— 关掉窗口、
+            # 或者中途崩了，刚导进来的几十笔就白导了（用户的真实账单这么丢过一次）。
+            # 裁定结果会在 with 退出时再存一次，两次写入互不影响。
+            try:
+                size = secure_store.save(ledger)
+                print(f"（已在打开界面前落盘，{size / 1024:.1f} KB —— 即使中途关掉窗口，")
+                print("  本次导入的数据也不会丢）")
+            except Exception as exc:
+                print(f"！提前落盘失败：{type(exc).__name__}: {exc}")
+                print("  导入数据目前只在内存里，请务必点完界面再关窗口。")
+
             resolved = review_ui.run(ledger)
             print(f"确认了 {resolved} 笔。")
 

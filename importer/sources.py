@@ -261,7 +261,8 @@ def _extract_dates(text: str) -> list:
 
 
 def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
-                          origin: str = "", encoding: str = "") -> ParseResult:
+                          origin: str = "", encoding: str = "",
+                          source: str = "bank_ocr") -> ParseResult:
     from .model import DIRECTION_EXPENSE, DIRECTION_INCOME, DIRECTION_NEUTRAL
 
     now = dt.datetime.now()
@@ -369,7 +370,7 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
             notes.append("截图未识别到时间，统一记为 00:00:00")
 
         txns.append(Txn(
-            source="bank_ocr",
+            source=source,
             ts=ts,
             amount=amount,
             direction=direction,
@@ -391,9 +392,9 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
         })
 
     return ParseResult(
-        source="bank_ocr",
+        source=source,
         txns=txns,
-        declared_count=None,      # 截图没有「共 N 笔」自述
+        declared_count=None,      # 截图/PDF 都没有「共 N 笔」自述
         skipped=skipped,
         path=path,
     )
@@ -411,9 +412,11 @@ def parse_bank_pdf(path: str, password: Optional[str] = None) -> ParseResult:
     notes = [f"PDF {meta['pages']} 页"]
     if meta.get("encrypted"):
         notes.append("已用密码解密")
-    result = _parse_bank_rows_auto(rows, path, origin="、".join(notes))
-    result.source = "bank_pdf"
-    return result
+    # source 必须一路传下去。之前只在结果对象上改 source，
+    # 每笔 Txn 还是写死的 "bank_ocr" —— 界面和报表读的是 Txn.source，
+    # 于是 PDF 导入的数据被显示成「银行卡截图」。
+    return _parse_bank_rows_auto(rows, path, origin="、".join(notes),
+                                 source="bank_pdf")
 
 
 # --------------------------------------------------------------------------
