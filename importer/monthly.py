@@ -236,12 +236,23 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                         fail.append((path, f"加密 {kind} 需要交互输入密码"))
                     continue
 
-            outcome = import_file(
-                path, ledger,
-                source=source, password=password,
-                use_ai=use_ai, ignore_power=ignore_power,
-                archive=True, dry_run=dry_run,
-            )
+            try:
+                outcome = import_file(
+                    path, ledger,
+                    source=source, password=password,
+                    use_ai=use_ai, ignore_power=ignore_power,
+                    archive=True, dry_run=dry_run,
+                )
+            except Exception as exc:
+                # 单个文件崩了不能带崩整批。文件留在原地，原因说清楚。
+                import traceback
+                print(f"  处理这个文件时崩了：{type(exc).__name__}: {exc}")
+                detail = traceback.format_exc().strip().splitlines()
+                for line in detail[-6:]:
+                    print(f"    {line.strip()}")
+                print("  文件留在原地，不会丢。")
+                fail.append((path, f"{type(exc).__name__}: {exc}"))
+                continue
 
             if not outcome.ok:
                 print(f"  未导入：{outcome.error}")

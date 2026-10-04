@@ -30,6 +30,7 @@ class ImportOutcome:
     batch_id: str = ""
     archived: str = ""
     months: set = field(default_factory=set)
+    failed_rows: list = field(default_factory=list)   # 单行写入失败，不影响其余
     error: str = ""
     dry_run: bool = False
 
@@ -117,25 +118,48 @@ def import_file(
     ledger.start_batch(outcome.source, path, origin="",
                        parsed=len(result.txns), declared=result.declared_count)
 
-    for txn in result.txns:
-        verdict = ledger.add(txn)
-        outcome.months.add(txn.ts.strftime("%Y-%m"))
-        if verdict.is_duplicate_skip:
-            outcome.identical += 1
-        elif verdict.needs_review:
-            outcome.suspect += 1
-            outcome.inserted += 1
-        else:
-            outcome.inserted += 1
+    # ------------------------------------------------------------------
+    # 逐笔写入，单行失败不拖垮整份账单。
+    #
+    # 这条来自真实事故：某份 PDF 解析出 31 笔，然后在写第一笔时抛异常，
+    # 整个导入中断 —— 批次记录建了但一笔没写，文件也没移走，
+    # 表面症状只有一句「解析 31 笔，写入 0 笔」，看不出到底哪里出问题。
+    # 现在把每笔的异常单独接住、记下来继续跑，最后连同失败原因一起报告。
+    # finish_batch 放进 finally，保证批次状态一定是完整的。
+    # ------------------------------------------------------------------
+    try:
+        for txn in result.txns:
+            try:
+                verdict = ledger.add(txn)
+            except Exception as exc:
+                outcome.failed_rows.append({
+                    "ts": txn.ts.isoformat(sep=" "),
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+                continue
 
-    ledger.finish_batch(len(result.txns), result.declared_count,
-                        outcome.inserted, outcome.identical,
-                        outcome.suspect, len(result.skipped))
+            outcome.months.add(txn.ts.strftime("%Y-%m"))
+            if verdict.is_duplicate_skip:
+                outcome.identical += 1
+            elif verdict.needs_review:
+                outcome.suspect += 1
+                outcome.inserted += 1
+            else:
+                outcome.inserted += 1
+    finally:
+        ledger.finish_batch(len(result.txns), result.declared_count,
+                            outcome.inserted, outcome.identical,
+                            outcome.suspect, len(result.skipped) + len(outcome.failed_rows))
+
     outcome.batch_id = ledger.batch_id
     outcome.ok = True
 
     emit(f"写入 {outcome.inserted} 笔  重复跳过 {outcome.identical} 笔  "
          f"疑似重复待确认 {outcome.suspect} 笔")
+    if outcome.failed_rows:
+        emit(f"！有 {len(outcome.failed_rows)} 笔写入失败（其余已入库）：")
+        for item in outcome.failed_rows[:5]:
+            emit(f"    {item['ts']}  {item['reason']}")
     emit(f"分类：规则命中 {cat_stats['rules']}，缓存命中 {cat_stats['cache']}，"
          f"本地 AI {cat_stats['ai']}，仍未分类 {cat_stats['unmatched']}")
 

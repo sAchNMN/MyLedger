@@ -94,6 +94,13 @@ def _memory_conn() -> sqlite3.Connection:
 
 def save(ledger: Ledger) -> int:
     """把内存里的库序列化 → 加密 → 落盘。返回密文字节数。"""
+    # 序列化前显式提交。
+    #
+    # serialize() 序列化的是「已提交的数据库镜像」。少一次 commit，
+    # 拿到的就是旧内容；紧接着 close() 又把未提交的事务回滚掉，
+    # 改动凭空消失而且**不报错** —— 这类静默丢数据最难查。
+    # 调用方大多会自己 commit，但把所有落盘路径都堵死在同一个地方更省心。
+    ledger.conn.commit()
     raw = ledger.conn.serialize()
     blob = credentials.protect(raw)
     _atomic_write(ledger.db_path, blob)

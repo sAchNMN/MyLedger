@@ -200,9 +200,18 @@ class Txn:
         刻意不包含 source——正是为了抓住跨渠道的同一笔交易。
         也刻意不包含商品名，因为同一笔交易在不同渠道的商品描述往往不同。
         """
+        # 金额格式化必须容错。Decimal 默认只有 28 位有效数字精度，
+        # 遇到超长数字（解析错抓来的卡号、流水号）时 quantize 会抛
+        # decimal.InvalidOperation —— 一条脏数据就能把整份账单的导入搞崩。
+        # format(x, "f") 不设精度限制，不会抛。
+        try:
+            amount_text = format(self.amount.quantize(Decimal("0.01")), "f")
+        except Exception:
+            amount_text = format(self.amount, "f")
+
         parts = [
             self.ts.strftime("%Y-%m-%d %H:%M"),
-            str(self.amount.quantize(Decimal("0.01"))),
+            amount_text,
             normalize_text(self.counterparty).lower(),
         ]
         digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()
