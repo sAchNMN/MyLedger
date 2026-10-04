@@ -226,6 +226,66 @@ class Txn:
         return data
 
 
+# --------------------------------------------------------------------------
+# 解析失败的错误码（ML-007）
+#
+# 为什么用码而不是自由文本：
+#     失败原因以前是一条自由文本，里面内嵌了原始单元格的值
+#     （"金额解析失败：'38.50元'"），有些还额外带一个 raw 字段装着整行原文。
+#     这些内容会被打印出来，后台执行器再把标准输出整段追加进
+#     vault\logs\monthly-YYYYMM.log —— 也就是一笔解析失败就把商户名、
+#     金额、单号、备注抄进了一个长期文本文件。
+#
+#     码是一张白名单：想往失败记录里加内容，就得先来改这张表，
+#     改的时候自然会想一下「这个字段是不是原始交易数据」。
+# --------------------------------------------------------------------------
+
+ISSUE_LABELS = {
+    "missing_header": "找不到表头行",
+    "missing_required_column": "表头缺少必需列",
+    "invalid_amount": "金额字段格式无效",
+    "invalid_datetime": "时间字段格式无效",
+    "empty_transaction": "这一行没有任何交易内容",
+    "unsupported_format": "不支持的文件格式",
+    "duplicate_row": "本次导入内的重复行",
+    "year_guessed": "有些行没有年份",
+}
+
+# 字段内部名 → 人话。只用于把「缺了哪个字段」说清楚，不含任何取值。
+FIELD_LABELS = {
+    "ts": "交易时间",
+    "amount": "金额",
+    "direction": "收支方向",
+    "counterparty": "交易对方",
+    "item": "商品",
+    "txn_id": "交易单号",
+}
+
+
+def describe_issue(issue: dict) -> str:
+    """把一条解析失败记录翻译成给人看的一句话。
+
+    输出里**只能**有行号、字段名和错误类型。这个函数是日志白名单的最后一环：
+    往这里加任何来自原始行的内容，等于把 ML-007 又打开一次。
+
+    不认识的错误码原样打出来，刻意不回退到任何自由文本字段 ——
+    那正是原始交易行溜进日志的入口。
+    """
+    row = issue.get("row") or 0
+    where = f"第 {row} 行" if row else "整份文件"
+    code = issue.get("reason_code") or ""
+    if code not in ISSUE_LABELS:
+        return f"{where}：{code or '未知错误'}"
+
+    if code == "missing_required_column":
+        names = "、".join(FIELD_LABELS.get(f, f) for f in (issue.get("fields") or []))
+        return f"{where}：{ISSUE_LABELS[code]}（{names}）"
+    if code == "year_guessed":
+        return (f"{where}：{issue.get('count', 0)} 行没有年份，"
+                f"按 {issue.get('year', '?')} 年处理")
+    return f"{where}：{ISSUE_LABELS[code]}"
+
+
 @dataclass
 class ParseResult:
     """一次解析的产出。declared_count 来自源文件自述的笔数。"""
@@ -233,7 +293,7 @@ class ParseResult:
     source: str
     txns: list
     declared_count: Optional[int] = None
-    skipped: list = field(default_factory=list)   # 解析失败的行，附原因
+    skipped: list = field(default_factory=list)   # 解析失败的行：只有行号/字段/错误码
     path: str = ""
 
     def summary(self) -> str:

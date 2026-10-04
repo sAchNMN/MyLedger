@@ -4,6 +4,19 @@
 所有脏活（编码、找表头、压缩包）都在 sniff 里做完了。
 
 新增一个数据源的成本 = 加一张别名表 + 写 10 行映射。
+
+关于解析失败记录（ML-007）
+--------------------------
+`ParseResult.skipped` 里**只允许**放三样东西：行号、字段名、错误码。
+
+以前这里放的是 `{"reason": f"金额解析失败：{cell!r}", "raw": 整行前 120 字}`，
+而 pipeline 会把这些原样打印出来，后台执行器再把标准输出整段追加进
+`vault\\logs\\monthly-YYYYMM.log`。也就是说：**一笔解析失败就等于把那一行的
+商户名、金额、单号、备注抄进了一个长期文本文件**，日志还会被备份和同步。
+
+所以这里刻意不留任何自由文本字段。「原因」这种东西一旦可以自由填写，
+早晚会有人（包括未来的我）为了好排障把原始值塞回去。
+需要人话的时候由 model.describe_issue() 从错误码翻译。
 """
 
 from __future__ import annotations
@@ -101,7 +114,7 @@ def _parse_rows(
     if header_row is None:
         return ParseResult(
             source=source, txns=[], declared_count=extract_declared_count(rows),
-            skipped=[{"row": 0, "reason": "整份文件里找不到表头行"}], path=path,
+            skipped=[{"row": 0, "reason_code": "missing_header"}], path=path,
         )
 
     header = header_names(rows[header_row])
@@ -113,8 +126,9 @@ def _parse_rows(
         return ParseResult(
             source=source, txns=[], declared_count=extract_declared_count(rows),
             skipped=[{
-                "row": header_row,
-                "reason": f"表头缺少必需列 {missing}，实际表头：{header}",
+                "row": header_row + 1,
+                "reason_code": "missing_required_column",
+                "fields": missing,
             }],
             path=path,
         )
@@ -136,8 +150,8 @@ def _parse_rows(
         if amount is None or amount == 0:
             skipped.append({
                 "row": row_no + 1,
-                "reason": f"金额解析失败：{cell(row, index, 'amount')!r}",
-                "raw": joined[:120],
+                "reason_code": "invalid_amount",
+                "field": "amount",
             })
             continue
 
@@ -145,8 +159,8 @@ def _parse_rows(
         if ts is None:
             skipped.append({
                 "row": row_no + 1,
-                "reason": f"时间解析失败：{cell(row, index, 'ts')!r}",
-                "raw": joined[:120],
+                "reason_code": "invalid_datetime",
+                "field": "ts",
             })
             continue
 
@@ -205,8 +219,9 @@ def parse_bank_ocr(tsv_path: str, password: Optional[str] = None) -> ParseResult
     """
     result = _parse_rows(load_table(tsv_path, None)[0], BANK_OCR_ALIASES,
                          "bank_ocr", tsv_path, "auto", "")
-    # _parse_rows 找不到表头时会返回「整份文件里找不到表头行」，这时改用自动识别
-    if result.txns or not result.skipped or "找不到表头行" not in result.skipped[0].get("reason", ""):
+    # _parse_rows 找不到表头时返回 missing_header，这时改用自动识别
+    if result.txns or not result.skipped or \
+            result.skipped[0].get("reason_code") != "missing_header":
         return result
     rows, encoding, origin = load_table(tsv_path, None)
     return _parse_bank_rows_auto(rows, tsv_path, origin=origin, encoding=encoding)
@@ -298,7 +313,8 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
             continue
         if not amounts:
             if any(_RE_HAS_CJK.search(c) for c in cells):
-                skipped.append({"row": row_no, "reason": "没有识别到带两位小数的金额"})
+                skipped.append({"row": row_no, "reason_code": "invalid_amount",
+                                "field": "amount"})
             continue
 
         for cell in cells:
@@ -319,7 +335,8 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
         try:
             amount = Decimal(digits)
         except InvalidOperation:
-            skipped.append({"row": row_no, "reason": f"金额解析失败：{digits}"})
+            skipped.append({"row": row_no, "reason_code": "invalid_amount",
+                            "field": "amount"})
             continue
 
         direction_hint = None
@@ -338,7 +355,8 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
         try:
             ts = dt.datetime(y, mo, d, h, mi, s)
         except ValueError:
-            skipped.append({"row": row_no, "reason": f"日期不合法：{y}-{mo}-{d}"})
+            skipped.append({"row": row_no, "reason_code": "invalid_datetime",
+                            "field": "ts"})
             continue
 
         # 没有年份的截图：如果落到未来，说明是去年的账单
@@ -388,8 +406,9 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
     if year_guessed:
         skipped.append({
             "row": 0,
-            "reason": (f"{year_guessed} 行没有年份，按 {year} 年处理；"
-                       f"若截图跨年请用 --password 之外的年份参数重跑（见文档）"),
+            "reason_code": "year_guessed",
+            "count": year_guessed,
+            "year": year,
         })
 
     return ParseResult(

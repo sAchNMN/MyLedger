@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .categorize import categorize
+from .model import describe_issue
 from .render import money
 from .sources import PARSERS, detect_source
 from .store import Ledger
@@ -152,7 +153,7 @@ def import_file(
             msg += f"，但文件自称有 {result.declared_count} 笔记录"
         emit(f"导入中止：{msg}。没有任何数据被写入。")
         for item in result.skipped[:5]:
-            emit(f"  跳过原因（第 {item.get('row')} 行）：{item.get('reason')}")
+            emit(f"  {describe_issue(item)}")
         outcome.status = "parse_failed"
         outcome.error = msg
         return outcome
@@ -161,10 +162,12 @@ def import_file(
         emit(f"！注意：解析到 {len(result.txns)} 笔，文件自称 {result.declared_count} 笔，"
              f"差 {result.declared_count - len(result.txns)} 笔。可能文件不完整。")
 
+    # 这里刻意只打印 describe_issue() 的结果：行号 + 字段 + 错误码。
+    # 这段文字会一路流进后台日志，所以绝不能带上那一行的原文（ML-007）。
     if result.skipped:
         emit(f"跳过 {len(result.skipped)} 行：")
         for item in result.skipped[:10]:
-            emit(f"  第 {item.get('row')} 行：{item.get('reason')}")
+            emit(f"  {describe_issue(item)}")
         if len(result.skipped) > 10:
             emit(f"  …另外 {len(result.skipped) - 10} 行")
 
@@ -200,13 +203,16 @@ def import_file(
     # ------------------------------------------------------------------
     completed = False
     try:
-        for txn in result.txns:
+        for index, txn in enumerate(result.txns, start=1):
             try:
                 verdict = ledger.add(txn)
             except Exception as exc:
+                # 只记「第几笔 + 异常类型」，不记时间和异常消息。
+                # 异常消息里可能带着行内容（而且时间本身就是消费记录的一部分），
+                # 而这些文字会进日志 —— 和解析失败同一条规矩（ML-007）。
                 outcome.failed_rows.append({
-                    "ts": txn.ts.isoformat(sep=" "),
-                    "reason": f"{type(exc).__name__}: {exc}",
+                    "index": index,
+                    "error_type": type(exc).__name__,
                 })
                 continue
 
@@ -252,7 +258,7 @@ def import_file(
     if outcome.failed_rows:
         emit(f"！有 {len(outcome.failed_rows)} 笔写入失败（其余已入库）：")
         for item in outcome.failed_rows[:5]:
-            emit(f"    {item['ts']}  {item['reason']}")
+            emit(f"    第 {item['index']} 笔写入失败（{item['error_type']}）")
         emit(f"！本批状态：{outcome.status_label} —— 源文件不会被归档，补完后再跑一次即可。")
     emit(f"分类：规则命中 {cat_stats['rules']}，缓存命中 {cat_stats['cache']}，"
          f"本地 AI {cat_stats['ai']}，仍未分类 {cat_stats['unmatched']}")
