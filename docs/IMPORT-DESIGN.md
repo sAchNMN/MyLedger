@@ -334,8 +334,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1 -Action remove
 ```
 
-后台运行的输出会追加到 `%USERPROFILE%\MyLedgerVault\logs\monthly-YYYYMM.log`。
+后台运行的结果写进 `%USERPROFILE%\MyLedgerVault\logs\monthly-YYYYMM.log`。
 **自动化的日志是必需品**——没人在旁边看的时候，出问题你只有这份日志可查。
+
+所以这份日志必须是**结构化且最小化**的（见 `importer/audit_log.py`）。
+它曾经是「把子进程的全部标准输出抄进文件」，那等于把解析失败的行、
+dry-run 预览、异常堆栈都留成明文，而日志不像账本那样加密，
+却往往是 vault 里唯一一份人人可读的副本。
+
+现在的做法是两件事分开：
+
+| 东西 | 去哪 | 内容 |
+|---|---|---|
+| 人看的报告 | 屏幕（继承控制台，不捕获） | 完整的处理过程和原因 |
+| 机器看的日志 | `logs\monthly-YYYYMM.log` | 只有白名单字段：计数、状态、错误码 |
+
+日志是一行一条 JSON，文件名过脱敏（长数字串 → `####`），
+不写完整路径、不写命令行、不写异常堆栈，也不写任何交易字段。
+
+计划任务里没有控制台，屏幕输出自然消失，不会落进日志。
+想事后复现问题，就手动跑一次 `scripts\monthly.cmd`。
 
 ### 7.5 关于密码：只输一次，用完即忘
 

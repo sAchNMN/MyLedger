@@ -37,8 +37,8 @@ import zipfile
 from datetime import datetime
 from typing import Optional
 
-from . import review_ui, secure_store
-from .pipeline import import_file
+from . import audit_log, review_ui, secure_store
+from .pipeline import ImportOutcome, import_file
 from .power import describe
 from .render import print_month, print_overview
 from .secure_store import open_encrypted
@@ -160,13 +160,65 @@ def _move_to_done(path: str, vault: str) -> str:
 
 
 def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
-        keep: bool = False, dry_run: bool = False, auto_review: bool = True) -> int:
+        keep: bool = False, dry_run: bool = False, auto_review: bool = True,
+        log_path: Optional[str] = None) -> int:
+    """跑一轮月度处理。返回退出码（0 = 全部处理完，2 = 有批次没完成）。
+
+    log_path 给定时写结构化审计日志（见 audit_log.py）：只有白名单字段，
+    没有交易内容、没有文件名原文、没有异常堆栈。后台执行器靠它留痕，
+    不再把子进程的全部输出抄进文件（ML-004）。
+    """
+    audit = audit_log.AuditLog(log_path) if log_path else None
+    outcomes: list[ImportOutcome] = []
+    months: set = set()
+    ok_count = 0
+    fail: list = []
+    partial: list = []
+
     box = ensure_inbox(vault)
     files = scan_inbox(vault)
     interactive = sys.stdin.isatty()
     # 只有在「有人在场 + 会真写库」时才自动弹确认界面。
     # 后台定时任务里弹浏览器是灾难：没人在场、窗口自动弹出、点都没人点。
     will_auto_review = auto_review and interactive and not dry_run
+
+    def note(path: str, index: int, status: str,
+             outcome: Optional[ImportOutcome] = None) -> None:
+        """记一条单个文件的结果（只记计数和错误码，不记文件名原文）。"""
+        if audit is None:
+            return
+        fields: dict = {
+            "index": index,
+            "status": status,
+            "file_masked": audit_log.mask_name(os.path.basename(path)),
+        }
+        if outcome is not None:
+            fields.update({
+                "source": outcome.source,
+                "parsed": outcome.parsed,
+                "declared": outcome.declared,
+                "inserted": outcome.inserted,
+                "identical": outcome.identical,
+                "suspect": outcome.suspect,
+                "skipped_rows": outcome.skipped,
+                "failed_rows": len(outcome.failed_rows),
+                "issue_codes": outcome.issue_codes,
+                "write_error_types": outcome.write_error_types,
+            })
+            outcomes.append(outcome)
+        audit.record(audit_log.EVENT_FILE, **fields)
+
+    def finish(code: int) -> int:
+        """收尾：落一条运行汇总，返回退出码。"""
+        if audit is not None:
+            summary = audit_log.summarise(outcomes, months)
+            summary["exit_code"] = code
+            audit.record(audit_log.EVENT_RUN_END, **summary)
+        return code
+
+    if audit is not None:
+        audit.record(audit_log.EVENT_RUN_START, files=len(files),
+                     interactive=interactive, dry_run=dry_run, ai=use_ai)
 
     print("=" * 72)
     print(f"MyLedger 月度处理   {datetime.now():%Y-%m-%d %H:%M:%S}")
@@ -187,23 +239,18 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
         print("投递目录里没有待处理的文件。")
         print("把导出的账单文件放进去，再跑一次即可。")
         print("（导出方法：python -m importer sources）")
-        return 0
+        return finish(0)
 
     print(f"发现 {len(files)} 个待处理文件")
     for path in files:
         print(f"  {os.path.basename(path)}")
-
-    months: set = set()
-    ok_count = 0
-    fail: list = []
-    partial: list = []
 
     # 一次运行内的密码只存在内存里：同一个渠道的多个 zip 不必重复输入，
     # 但运行一结束就随进程一起消失，不落任何盘。
     session_passwords: dict = {}
 
     with open_encrypted(vault, save_on_exit=not dry_run) as ledger:
-        for path in files:
+        for index, path in enumerate(files, start=1):
             print()
             print("-" * 72)
             print(f"处理：{os.path.basename(path)}")
@@ -213,6 +260,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                 print("  识别不出这是哪个渠道的账单，留在原地等你处理。")
                 print("  确认渠道后可手动指定：python -m importer import <文件> --source alipay|wechat|bank")
                 fail.append((path, "无法识别数据源"))
+                note(path, index, "not_recognised")
                 continue
 
             label = {"alipay": "支付宝", "wechat": "微信",
@@ -235,6 +283,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                         print("  处理办法：登录后双击 scripts\\monthly.cmd 手动跑一次；")
                         print("            或者自己解开后把 csv 丢进投递目录。")
                         fail.append((path, f"加密 {kind} 需要交互输入密码"))
+                    note(path, index, "needs_password")
                     continue
 
             try:
@@ -246,6 +295,10 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                 )
             except Exception as exc:
                 # 单个文件崩了不能带崩整批。文件留在原地，原因说清楚。
+                #
+                # 这段堆栈只打到屏幕上，绝不进日志：后台执行器不再收子进程的
+                # 标准输出（见 scripts\\monthly-run.ps1），日志里只会有下面这条
+                # 「哪个文件、什么状态」的白名单记录。
                 import traceback
                 print(f"  处理这个文件时崩了：{type(exc).__name__}: {exc}")
                 detail = traceback.format_exc().strip().splitlines()
@@ -253,6 +306,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                     print(f"    {line.strip()}")
                 print("  文件留在原地，不会丢。")
                 fail.append((path, f"{type(exc).__name__}: {exc}"))
+                note(path, index, "crashed")
                 continue
 
             if not outcome.ok:
@@ -271,6 +325,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                 else:
                     print("  一笔都没有写入。文件留在原地，不会丢。")
                     fail.append((path, outcome.error))
+                note(path, index, outcome.status, outcome)
                 continue
 
             ok_count += 1
@@ -288,6 +343,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             else:
                 moved = _move_to_done(path, vault)
                 print(f"  已移入 {os.path.relpath(moved, box)}")
+            note(path, index, outcome.status, outcome)
 
         # --------------------------------------------------------------
         # 报表
@@ -347,4 +403,4 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             print(f"有 {suspects} 笔疑似重复等你确认。用大按钮界面最快：")
         print("  python -m importer review --ui")
 
-    return 0 if not fail and not partial else 2
+    return finish(0 if not fail and not partial else 2)

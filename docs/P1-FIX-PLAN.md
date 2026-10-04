@@ -53,15 +53,18 @@ P2/P3、依赖锁定、测试入口统一等工程化项**本轮不动**。
 |---|---|---|---|
 | B1 | 解析失败改成结构化错误码，删掉原始行与原始值 | `importer/sources.py` | ✅ |
 | B2 | 跳过行的打印走白名单（行号 + 字段 + 错误码） | `importer/pipeline.py`、`importer/model.py` | ✅ |
-| B3 | 新增结构化审计日志模块（只写白名单字段） | `importer/audit_log.py`（新） | ⬜ |
-| B4 | 后台执行器改为传日志文件，不再收全部 stdout | `scripts/monthly-run.ps1`、`importer/monthly.py`、`importer/cli.py` | ⬜ |
+| B3 | 新增结构化审计日志模块（只写白名单字段） | `importer/audit_log.py`（新） | ✅ |
+| B4 | 后台执行器改为传日志文件，不再收全部 stdout | `scripts/monthly-run.ps1`、`importer/monthly.py`、`importer/cli.py` | ✅ |
+| B0 | （顺带）`scripts/*.ps1` 的 UTF-8 BOM 守卫：无 BOM 时 PS 5.1 按 ANSI 读，中文注释会读成语法错误 | `tests/test_background_log.py` | ✅ |
 
 > B1 与 B2 合并成一次提交：删掉 `reason` 字段后 pipeline 的打印会变成 `None`，
 > 两块必须同时落地才算「没退化」。
 
 验收（合成数据）：构造含 `商户_TEST` / `123.45` / `TEST-001` / `TEST_NOTE` 的失败行，
-扫日志确认这四类字符串一个都不出现。**已通过**：`tests/test_parse_issues.py`
-（解析结果、打印文本两处都做了标记串扫描）。
+扫日志确认这四类字符串一个都不出现。**已通过**：
+`tests/test_parse_issues.py`（解析结果与打印文本）、
+`tests/test_audit_log.py`（日志白名单）、
+`tests/test_background_log.py`（真跑 `monthly-run.ps1`，按字节扫日志文件）。
 
 ### 阶段 C —— ML-008 复核请求失败仍跳过当前记录（P1）
 

@@ -111,6 +111,7 @@ def cmd_monthly(args) -> int:
         use_ai=args.ai, ignore_power=args.ignore_power,
         keep=args.keep, dry_run=args.dry_run,
         auto_review=not args.no_review,
+        log_path=args.log_file,
     )
 
 
@@ -340,6 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-review", action="store_true",
                    help="即使发现疑似重复也不要自动打开确认界面")
     p.add_argument("--dry-run", action="store_true", help="只解析不写库、不移文件")
+    p.add_argument("--log-file", default=None,
+                   help="把结构化审计日志追加到这里（只有计数和错误码，不含交易内容）")
     p.set_defaults(func=cmd_monthly)
 
     # ---- import ----

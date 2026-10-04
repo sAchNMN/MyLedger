@@ -73,6 +73,10 @@ class ImportOutcome:
     failed_rows: list = field(default_factory=list)   # 单行写入失败，不影响其余
     error: str = ""
     dry_run: bool = False
+    # 下面两个是给后台日志用的：只有错误码和异常类型名，不含任何取值。
+    # 日志要能回答「出了哪类问题」，但不能回答「谁在哪花了多少」。
+    issue_codes: list = field(default_factory=list)
+    write_error_types: list = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -136,6 +140,8 @@ def import_file(
     outcome.parsed = len(result.txns)
     outcome.declared = result.declared_count
     outcome.skipped = len(result.skipped)
+    outcome.issue_codes = sorted({item.get("reason_code") or "unknown"
+                                  for item in result.skipped})
     emit(result.summary())
 
     # ------------------------------------------------------------------
@@ -250,6 +256,7 @@ def import_file(
                             outcome.inserted, outcome.identical,
                             outcome.suspect, len(result.skipped) + len(outcome.failed_rows),
                             status=final_status)
+        outcome.write_error_types = sorted({row["error_type"] for row in outcome.failed_rows})
 
     outcome.batch_id = ledger.batch_id
 
