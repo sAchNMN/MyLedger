@@ -8,11 +8,15 @@
 
 from __future__ import annotations
 
+import datetime as dt
+import re
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 
 from .model import (
     ParseResult,
     Txn,
+    normalize_text,
     parse_amount,
     parse_datetime,
     parse_direction,
@@ -191,10 +195,207 @@ def parse_wechat(path: str, password: Optional[str] = None) -> ParseResult:
     return _parse_rows(rows, WECHAT_ALIASES, "wechat", path, encoding, origin)
 
 
-def parse_bank_ocr(tsv_path: str) -> ParseResult:
-    """银行截图 OCR 后的 TSV。OCR 环节见 scripts/bank-ocr.ps1。"""
+def parse_bank_ocr(tsv_path: str, password: Optional[str] = None) -> ParseResult:
+    """银行截图 OCR 后的 TSV。
+
+    先按表头解析（万一某家银行的 OCR 结果带表头）；没有表头就走自动字段识别。
+    自动识别是必须的——银行 APP 的截图里不存在「表头行」这个概念，
+    OCR 出来就是一堆按坐标重组的文本行，只有靠字段长相判断哪个是时间、哪个是金额。
+    """
+    result = _parse_rows(load_table(tsv_path, None)[0], BANK_OCR_ALIASES,
+                         "bank_ocr", tsv_path, "auto", "")
+    # _parse_rows 找不到表头时会返回「整份文件里找不到表头行」，这时改用自动识别
+    if result.txns or not result.skipped or "找不到表头行" not in result.skipped[0].get("reason", ""):
+        return result
+    return _parse_bank_rows_auto(tsv_path)
+
+
+# --------------------------------------------------------------------------
+# 银行截图：无表头的自动字段识别
+#
+# 思路是完全确定的（不猜语义，只看字段长得像什么）：
+#   1. 找形如日期 / 时间的单元格 → ts
+#   2. 找形如金额的单元格 → amount（带符号或带「支出/收入」字样的同时定方向）
+#   3. 剩下的中文长文本里最长的那个 → 交易对方
+#   4. 时间和金额缺任何一个的行直接丢弃（那是「本月合计」这类标签行）
+#
+# 刻意不做的事：不去猜「哪个是商户名」。宁可把对方留空，
+# 也好过把一串流水号当成商户名写进账本——那种错你不会发现。
+# --------------------------------------------------------------------------
+
+_RE_DATE = re.compile(r"^\s*(?:(\d{4})[-/.年])?(\d{1,2})[-/.月](\d{1,2})日?\s*$")
+# 「在文本里找日期」用这个：09-15 / 2026-09-15 / 9.15，后面不能再接数字
+_RE_DATE_TOKEN = re.compile(r"(?:(\d{4})[-/.年])?(\d{1,2})[-/.月](\d{1,2})日?(?!\d)")
+_RE_TIME = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$")
+
+# 金额 token：**必须带两位小数**（可选货币符号 / 正负号）。
+#
+# 为什么死磕「两位小数」：这是整条银行截图链路里最强的判据。
+#   * 银行金额永远是两位小数（38.50 / 0.00），不会写成 38.5
+#   * 日期「09-15」没有小数点，余额「1234.56」格式相同但通常是另一个 token，
+#     靠「取第一个 / 带符号的优先」区分
+#   * 只要求「是个数字」会把日期、序号、卡号全吸进来 —— 那是灾难
+_RE_AMOUNT_TOKEN = re.compile(r"[¥￥$]?\s*([+-])?\s*(\d{1,3}(?:,\d{3})*|\d+)\.(\d{2})(?!\d)")
+_RE_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
+_INCOME_WORDS = ("收入", "转入", "存入", "入账", "退款", "贷")
+_EXPENSE_WORDS = ("支出", "转出", "消费", "付款", "扣款", "借")
+
+
+def _extract_amounts(text: str) -> list:
+    """从一段文本里抠出所有金额 token，返回 [(符号, 数字串)]。"""
+    out = []
+    for sign, integer, decimals in _RE_AMOUNT_TOKEN.findall(text):
+        out.append((sign or "", f"{integer.replace(',', '')}.{decimals}"))
+    return out
+
+
+def _extract_dates(text: str) -> list:
+    """从一段文本里抠出所有日期 token，返回 [(年或None, 月, 日)]。"""
+    out = []
+    for y, mo, d in _RE_DATE_TOKEN.findall(text):
+        mo, d = int(mo), int(d)
+        if 1 <= mo <= 12 and 1 <= d <= 31:
+            out.append((int(y) if y else None, mo, d))
+    return out
+
+
+def _parse_bank_rows_auto(tsv_path: str, default_year: Optional[int] = None) -> ParseResult:
+    from .model import DIRECTION_EXPENSE, DIRECTION_INCOME, DIRECTION_NEUTRAL
+
     rows, encoding, origin = load_table(tsv_path, None)
-    return _parse_rows(rows, BANK_OCR_ALIASES, "bank_ocr", tsv_path, encoding, origin)
+    now = dt.datetime.now()
+    year = default_year or now.year
+
+    txns: list[Txn] = []
+    skipped: list[dict] = []
+    year_guessed = 0
+
+    for row_no, row in enumerate(rows, start=1):
+        cells = [c for c in (normalize_text(c) for c in row) if c]
+        if not cells:
+            continue
+
+        # ------------------------------------------------------------------
+        # 逐格「找 token」，不是逐格「判定整格是什么」。
+        #
+        # 这是被真实数据逼出来的：把同一行的碎片按间距拼接后，
+        # 日期和金额经常落进同一个格子里（「09-15 38.50」）。
+        # 要求整格匹配金额，结果就是 31 笔真实交易全部解析失败。
+        # 改成在文本里搜 token，合并与否都能捞出来。
+        # ------------------------------------------------------------------
+        dates: list = []
+        amounts: list = []
+        time_part = None
+        for cell in cells:
+            dates.extend(_extract_dates(cell))
+            for sign, digits in _extract_amounts(cell):
+                amounts.append((sign, digits))
+
+        if not dates:
+            continue
+        if not amounts:
+            if any(_RE_HAS_CJK.search(c) for c in cells):
+                skipped.append({"row": row_no, "reason": "没有识别到带两位小数的金额"})
+            continue
+
+        for cell in cells:
+            m = _RE_TIME.match(cell)
+            if m:
+                h, mi, s = m.groups()
+                time_part = (int(h), int(mi), int(s or 0))
+                break
+
+        # 一行出现多个两位小数时（银行流水常同时显示「金额」和「余额」）：
+        # 优先取带正负号的；都没符号就取第一个，并在备注里标出来让人核。
+        signed = [a for a in amounts if a[0]]
+        sign, digits = signed[-1] if signed else amounts[0]
+        multi_amount_note = ""
+        if len(amounts) > 1 and not signed:
+            multi_amount_note = f"该行识别到 {len(amounts)} 个金额（可能是余额），已取第一个，请核对"
+
+        try:
+            amount = Decimal(digits)
+        except InvalidOperation:
+            skipped.append({"row": row_no, "reason": f"金额解析失败：{digits}"})
+            continue
+
+        direction_hint = None
+        blob = "".join(cells)
+        if any(w in blob for w in _INCOME_WORDS):
+            direction_hint = DIRECTION_INCOME
+        elif any(w in blob for w in _EXPENSE_WORDS):
+            direction_hint = DIRECTION_EXPENSE
+
+        date_part = dates[0]
+        y, mo, d = date_part
+        if y is None:
+            y = year
+            year_guessed += 1
+        h, mi, s = time_part or (0, 0, 0)
+        try:
+            ts = dt.datetime(y, mo, d, h, mi, s)
+        except ValueError:
+            skipped.append({"row": row_no, "reason": f"日期不合法：{y}-{mo}-{d}"})
+            continue
+
+        # 没有年份的截图：如果落到未来，说明是去年的账单
+        if date_part[0] is None and ts > now:
+            try:
+                ts = ts.replace(year=y - 1)
+            except ValueError:
+                pass
+
+        if direction_hint:
+            direction = direction_hint
+        elif sign == "+":
+            direction = DIRECTION_INCOME
+        else:
+            direction = DIRECTION_EXPENSE   # 银行流水里绝大多数是支出，负数也归这里
+
+        # 剩下的中文里最长的那个当交易对方。
+        # 刻意「不猜」：宁可留空，也好过把一串流水号或「余额」当成商户名。
+        candidates = [
+            c for c in cells
+            if _RE_HAS_CJK.search(c) and len(c) >= 2
+            and not _extract_dates(c) and not _extract_amounts(c)
+        ]
+        counterparty = max(candidates, key=len) if candidates else ""
+
+        notes = []
+        if multi_amount_note:
+            notes.append(multi_amount_note)
+        if time_part is None:
+            notes.append("截图未识别到时间，统一记为 00:00:00")
+
+        txns.append(Txn(
+            source="bank_ocr",
+            ts=ts,
+            amount=amount,
+            direction=direction,
+            counterparty=counterparty,
+            item="",
+            method="",
+            status="",
+            txn_id="",              # 截图里通常没有可用的流水号，靠内容指纹去重
+            merchant_order_id="",
+            note="；".join(notes),
+            raw={"来源": origin, "编码": encoding, "数据行": row_no, "原始": row},
+        ))
+
+    if year_guessed:
+        skipped.append({
+            "row": 0,
+            "reason": (f"{year_guessed} 行没有年份，按 {year} 年处理；"
+                       f"若截图跨年请用 --password 之外的年份参数重跑（见文档）"),
+        })
+
+    return ParseResult(
+        source="bank_ocr",
+        txns=txns,
+        declared_count=None,      # 截图没有「共 N 笔」自述
+        skipped=skipped,
+        path=tsv_path,
+    )
 
 
 # --------------------------------------------------------------------------
