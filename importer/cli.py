@@ -1,6 +1,7 @@
 """命令行入口。
 
-    python -m importer monthly                 月度批处理（推荐用法）
+    python -m importer web                     本地网页控制台（推荐日常使用）
+    python -m importer monthly                 月度批处理（命令行版）
     python -m importer review --ui             疑似重复确认（两个大按钮）
     python -m importer import <文件...>         单文件导入
     python -m importer report [--month 2026-09] 消费汇总
@@ -25,7 +26,7 @@ import os
 import subprocess
 import sys
 
-from . import __version__, fixups, monthly, review_ui, secure_store
+from . import __version__, fixups, monthly, review_ui, secure_store, webui
 from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
 from .model import SOURCE_LABELS
 from .pipeline import import_file
@@ -234,6 +235,15 @@ def cmd_setcat(args) -> int:
     if not args.apply:
         print("已入库的历史交易**未改动**。确认上面的试算结果后，加 --apply 执行。")
     return 0
+
+
+# --------------------------------------------------------------------------
+# web —— 本地网页控制台
+# --------------------------------------------------------------------------
+
+def cmd_web(args) -> int:
+    """打开本地网页控制台。日常使用推荐这个，不用记命令。"""
+    return webui.run(_vault(args), port=args.port, open_browser=not args.no_browser)
 
 
 # --------------------------------------------------------------------------
@@ -504,6 +514,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", action="store_true",
                    help="同时改已入库的历史交易（会先备份密文）")
     p.set_defaults(func=cmd_setcat)
+
+    # ---- web ----
+    p = _add_vault(sub.add_parser(
+        "web", help="打开本地网页控制台（不用记命令，日常推荐）"))
+    p.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
+    p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    p.set_defaults(func=cmd_web)
 
     # ---- sources ----
     sub.add_parser("sources", help="各渠道怎么导出账单").set_defaults(func=cmd_sources)

@@ -133,6 +133,15 @@ def _needs_password(path: str) -> bool:
         return False
 
 
+def file_needs_password(path: str) -> bool:
+    """对外名字：这个文件要不要密码。
+
+    网页控制台靠它决定「哪些文件得让你先填密码」。
+    正文里一律走这个函数，不要再从外面直接摸 _needs_password。
+    """
+    return _needs_password(path)
+
+
 def _prompt_password(label: str, kind: str = "压缩包") -> Optional[str]:
     """交互式索取密码。拿不到就返回 None，绝不猜、绝不回退到空密码。"""
     if not sys.stdin.isatty():
@@ -160,10 +169,25 @@ def _move_to_done(path: str, vault: str) -> str:
 
 
 def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
-        keep: bool = False, dry_run: bool = False, auto_review: bool = True) -> int:
+        keep: bool = False, dry_run: bool = False, auto_review: bool = True,
+        passwords: Optional[dict] = None,
+        interactive: Optional[bool] = None) -> int:
+    """跑一次月度批处理。
+
+    三个参数是给「网页控制台」这类非终端调用方用的（cli 不传，行为不变）：
+
+    passwords   {数据源: 密码}。网页控制台把用户在页面上填的密码从这里注入，
+                而不是让 getpass 去读一个不存在的控制台。
+    interactive None = 按 sys.stdin.isatty() 判断。
+                网页控制台必须显式传 False —— 从 .cmd 双击启动时
+                stdin **是**终端，不传的话会误判成交互式，进而在 cmd 窗口里
+                弹密码提示、并自动拉起另一个确认界面（服务套服务）。
+    auto_review 同上，网页控制台自己有确认页面，传 False。
+    """
     box = ensure_inbox(vault)
     files = scan_inbox(vault)
-    interactive = sys.stdin.isatty()
+    if interactive is None:
+        interactive = sys.stdin.isatty()
     # 只有在「有人在场 + 会真写库」时才自动弹确认界面。
     # 后台定时任务里弹浏览器是灾难：没人在场、窗口自动弹出、点都没人点。
     will_auto_review = auto_review and interactive and not dry_run
@@ -199,7 +223,8 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
 
     # 一次运行内的密码只存在内存里：同一个渠道的多个 zip 不必重复输入，
     # 但运行一结束就随进程一起消失，不落任何盘。
-    session_passwords: dict = {}
+    # 网页控制台传进来的密码同样只活在这次调用里，用完即忘。
+    session_passwords: dict = dict(passwords or {})
 
     with open_encrypted(vault, save_on_exit=not dry_run) as ledger:
         for path in files:
@@ -221,19 +246,16 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             password = session_passwords.get(source)
             if _needs_password(path):
                 kind = "PDF" if path.lower().endswith(".pdf") else "压缩包"
-                if password is None:
+                if password is None and interactive:
                     password = _prompt_password(label, kind)
                     if password:
                         session_passwords[source] = password
                 if not password:
-                    if interactive:
-                        print("  未输入密码，跳过。文件留在原地。")
-                        fail.append((path, "需要密码但没有输入"))
-                    else:
-                        print(f"  这是加密 {kind}，后台运行没法输密码。")
-                        print("  处理办法：登录后双击 scripts\\monthly.cmd 手动跑一次；")
-                        print("            或者自己解开后把 csv 丢进投递目录。")
-                        fail.append((path, f"加密 {kind} 需要交互输入密码"))
+                    print(f"  这是加密 {kind}，当前运行方式拿不到密码，跳过。")
+                    print("  处理办法：在能输入密码的地方重跑一次 ——")
+                    print("            网页控制台在导入页填密码；命令行交互式运行会提示输入。")
+                    print("            或者自己解开后把 csv 丢进投递目录。")
+                    fail.append((path, f"加密 {kind} 需要密码"))
                     continue
 
             try:
