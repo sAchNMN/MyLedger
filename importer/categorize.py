@@ -38,6 +38,13 @@ CATEGORIES = (
 
 DEFAULT_CATEGORY = "未分类"
 
+# merchant_category 表里 decided_by 的取值。
+# manual 是最高优先级：它压过规则，也压过本地 AI。
+# 用户手工纠正过的分类，程序**任何路径**都不许改回去。
+DECIDED_BY_MANUAL = "manual"
+DECIDED_BY_RULE = "rule"
+DECIDED_BY_AI = "ai"
+
 # 这几个分类按定义就不是「消费」：钱只是在自己的账户之间搬，或者是在还自己的账。
 #
 # 判定为这几个分类的交易，方向一律压成中性，不管平台在「收/支」列里写了什么。
@@ -105,6 +112,77 @@ def classify_by_rules(counterparty: str, item: str = "") -> Optional[str]:
             if keyword.lower() in blob:
                 return category
     return None
+
+
+# --------------------------------------------------------------------------
+# 人工指定（优先级最高）
+#
+# 为什么需要这一层：
+#   规则靠「关键词 + 顺序」，它解决的是常见商户。总有认不出来的：
+#   商户名只有「某某网络科技有限公司」这类公司全称、商品描述只有一个
+#   「缴费」而看不出是什么费。给规则加词能解一时，但每加一个词都在
+#   赌它不会吸走别的交易（「缴费」抢走「学费」就是这么来的）。
+#
+#   所以留一个**人说了算**的口子：用户自己看一眼就知道这是什么，
+#   直接指定分类，不写代码、不改规则表，也不会误伤别的商户。
+#
+# 它为什么比「改规则表」安全：
+#   规则是全局的、按关键词匹配的；人工指定是**按商户精确匹配**的。
+#   指定「某某餐饮管理有限公司 = 餐饮」不会影响任何其它商户。
+#
+# 存哪儿：直接复用 merchant_category 这张缓存表，decided_by='manual'。
+#   categorize() 本来就会先读这张表，所以指定完**下次导入自动生效**；
+#   已经入库的历史交易要靠 fixups.apply_manual 才会跟着变。
+# --------------------------------------------------------------------------
+
+def manual_map(ledger) -> dict[str, str]:
+    """读出全部「人工指定」的商户 → 分类。键是归一化后的商户名。"""
+    return {
+        row["merchant"]: row["category"]
+        for row in ledger.conn.execute(
+            "SELECT merchant, category FROM merchant_category WHERE decided_by = ?",
+            (DECIDED_BY_MANUAL,),
+        )
+    }
+
+
+def set_manual(ledger, merchant: str, category: str) -> str:
+    """手工指定一个商户的分类。返回归一化后的商户键。
+
+    只写缓存表。新导入的交易下一次就会用上；
+    已经在库里的历史交易需要 fixups.apply_manual 才会跟着变。
+    """
+    key = normalize_text(merchant)
+    if not key:
+        raise ValueError("商户名不能为空")
+    if category not in CATEGORIES:
+        raise ValueError(
+            f"不认识的分类「{category}」。可用分类：{'、'.join(CATEGORIES)}"
+        )
+    _remember(ledger, key, category, DECIDED_BY_MANUAL)
+    ledger.conn.commit()
+    return key
+
+
+def clear_manual(ledger, merchant: str) -> bool:
+    """撤销某个商户的人工指定，退回规则判定。返回是否确实删掉了一行。"""
+    cur = ledger.conn.execute(
+        "DELETE FROM merchant_category WHERE merchant = ? AND decided_by = ?",
+        (normalize_text(merchant), DECIDED_BY_MANUAL),
+    )
+    ledger.conn.commit()
+    return cur.rowcount > 0
+
+
+def category_for(merchant_key: str, counterparty: str, item: str = "",
+                 manual: Optional[dict[str, str]] = None) -> Optional[str]:
+    """分类优先级：人工指定 > 规则 > None（没命中）。
+
+    把优先级集中在这一处，recompute 与导入两条路径就不会各自漂移。
+    """
+    if manual and merchant_key in manual:
+        return manual[merchant_key]
+    return classify_by_rules(counterparty, item)
 
 
 # --------------------------------------------------------------------------
@@ -235,7 +313,7 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
             txn.category = hit
             stats["rules"] += 1
             if merchant:
-                _remember(ledger, merchant, hit, "rule")
+                _remember(ledger, merchant, hit, DECIDED_BY_RULE)
                 cache[merchant] = hit
             continue
 
@@ -273,7 +351,7 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
         if txn.category == DEFAULT_CATEGORY and merchant in mapping:
             txn.category = mapping[merchant]
             stats["ai"] += 1
-            _remember(ledger, merchant, mapping[merchant], "ai")
+            _remember(ledger, merchant, mapping[merchant], DECIDED_BY_AI)
             cache[merchant] = mapping[merchant]
 
     ledger.conn.commit()
@@ -282,6 +360,20 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
 
 
 def _remember(ledger, merchant: str, category: str, decided_by: str) -> None:
+    """写进商户→分类缓存。
+
+    内置一道守卫：**人工指定的记录不许被规则或 AI 覆盖。**
+    没有这道闸，用户手工改完分类，下次导入同一商户时规则一命中就把它
+    悄悄改回去 —— 没有任何提示，用户只会觉得「我明明改过了，怎么又变回来了」。
+    """
+    if decided_by != DECIDED_BY_MANUAL:
+        existing = ledger.conn.execute(
+            "SELECT decided_by FROM merchant_category WHERE merchant = ?",
+            (merchant,),
+        ).fetchone()
+        if existing is not None and existing["decided_by"] == DECIDED_BY_MANUAL:
+            return
+
     ledger.conn.execute(
         "INSERT INTO merchant_category (merchant, category, decided_by, decided_at)"
         " VALUES (?,?,?,?) ON CONFLICT(merchant) DO UPDATE SET"

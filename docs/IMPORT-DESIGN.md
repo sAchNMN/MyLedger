@@ -3,7 +3,7 @@
 > 目标：每个月把自己的账单导进来，看清钱花在哪。
 > 约束：完全本地运行、不泄露、少出错、不重复记账。
 >
-> 最后更新：2026-10-04
+> 最后更新：2026-10-05
 
 ---
 
@@ -159,6 +159,7 @@ python -m importer review --resolve 12 --as ok    # 是两笔独立交易，不�
 | 找表头、跳过说明行 | 规则 | 同上 |
 | 去重判定 | 规则 | 见第 3 节 |
 | **商户名 → 消费分类** | 规则优先，**本地 AI 兜底** | 真的模糊：「某某网络科技有限公司」是干什么的，规则答不上来 |
+| **规则和 AI 都认不出的个别商户** | **人工指定**（`setcat`） | 人看一眼就知道是什么。按商户精确生效，比往规则表加宽关键词安全——不会吸走别的交易 |
 | **银行截图文字 → 结构化行** | 本地 OCR + 规则，AI 兜底 | OCR 出的是乱文本，需要语义理解才能拆成字段 |
 
 AI 的三条硬约束（写在代码里，不是口头承诺）：
@@ -178,6 +179,32 @@ python -m importer import <账单> --ai
 ```
 
 没装 Ollama 也能正常用，规则能覆盖大部分常见商户。
+
+### 4.1 分类优先级：人工 > 规则 > 原值
+
+三个来源都可能给分类，顺序写死，别随手改：
+
+- **人工指定（最高）** —— `setcat`。用户看一眼就知道是什么，压过规则和 AI。
+  存在 `merchant_category` 表（`decided_by='manual'`），新导入的交易自动生效；
+  已入库的历史交易用 `--apply` 回填。按**商户**精确匹配，不会误伤别的交易。
+- **规则** —— 关键词表，见 `categorize.RULES`，**先具体后笼统**。
+- **本地 AI** —— 规则认不出才轮到它，结果进缓存。见上文。
+
+`recompute`（按规则修正历史）用「人工 > 规则 > **原值**」：原值垫底是为了
+不把本地 AI 给过的分类洗成未分类。
+
+而撤销人工指定（`setcat --clear`）**落到「未分类」**，不是保留原值 ——
+撤销是个明确动作，必须让人看见分类真的变回去了。
+
+补分类的推荐姿势：
+
+```bash
+python -m importer unmatched                       # 先看漏了哪些商户、各占多少钱
+python -m importer setcat "商户名" 餐饮 --apply      # 归位，写缓存 + 回填历史
+```
+
+> 商户名本身就是账单数据。**别把未分类商户名贴给云端 AI「帮我归类」**，
+> 用 `unmatched` 在本机看、用 `setcat` 在本机归，或走本地 Ollama。
 
 ---
 
@@ -241,11 +268,18 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 命令：
 
 ```bash
+# 日常推荐：双击根目录 MyLedger.cmd，浏览器自动打开网页控制台，不用记命令
+python -m importer web                      # 起网页控制台（--port 8765，--no-browser 不自动开）
 python -m importer monthly                  # 月度批处理（推荐）
 python -m importer review --ui              # 疑似重复确认：两个大按钮（推荐）
 python -m importer review                   # 同上，但输出在终端里
 python -m importer import <文件> [--password 密码] [--dry-run]
 python -m importer report [--month 2026-09]
+python -m importer unmatched [--month 2026-09] [--mask]   # 未分类交易按商户聚合
+python -m importer setcat "商户名" 餐饮 [--apply]           # 手工指定分类（优先级最高）
+python -m importer setcat --list                            # 看已有哪些人工指定
+python -m importer setcat --clear "商户名" [--apply]         # 撤销，退回规则
+python -m importer recompute [--apply]      # 按当前规则修正历史数据（默认只试算）
 python -m importer store                    # 查看账本加密状态
 python -m importer sources                  # 各渠道导出方法速查
 python -m importer ocr <图片...>
@@ -516,6 +550,19 @@ python -m importer review --ui
 | `review --ui` 鉴权 | 无令牌访问 `/state` 返回 403 |
 | `review --ui` 裁定 | 裁定写库正确，报表实时反映（餐饮 145.50→117.00） |
 | 加密 zip 后台跳过 | `_needs_password` 判定 True，明确提示并留在原地 |
+| 未分类盘点（`unmatched`） | 按商户聚合正确，支出/收入分开计；`--mask` 遮蔽生效 |
+| 手工指定分类（`setcat`） | 新导入走人工分类、压过规则；`recompute` 不会把它改回去 |
+| 手工分类回填历史 | `--apply` 后重新读密文核对一致；只改目标商户，别的商户不动 |
+| 撤销人工指定 | 退回规则；规则认不出则落到「未分类」，变化可见 |
+| 方向双向还原 | 指定成非消费分类 → 支出压中性；撤销 → 回到支出 |
+| 分类优先级回归 | `tests/test_manual_category.py` 30 项全过 |
+| 网页控制台鉴权 | 无令牌访问 `/api/*` 返回 403；令牌正确返回 200 |
+| 网页控制台密码 | 填对的密码（数据源为键）导入成功；密码不出现在日志 / 任务参数 / 密文 |
+| 网页控制台导入链路 | HTTP 提交 monthly → 任务队列执行 → 概览/报表/未分类数据一致 |
+| 网页控制台并发 | 任务运行中再提交返回 409，不双跑账本 |
+| 网页控制台编码 | `MyLedger.cmd` 纯 ASCII + 无 BOM + CRLF；中文由 Python 打印无乱码 |
+| 网页控制台渲染 | headless Edge 实测：JS 渲染后 DOM 出现真实数据（16 笔 / 54.9% / 604.80） |
+| 网页控制台回归 | `tests/test_webui.py` 全过（含启动器约定） |
 
 **未验证（需要你本人操作）：**
 

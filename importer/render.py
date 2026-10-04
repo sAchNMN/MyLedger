@@ -42,6 +42,21 @@ def money(value) -> str:
     return f"{Decimal(str(value or 0)):,.2f}"
 
 
+def mask_merchant(name) -> str:
+    """把商户名遮蔽成「首字 + ***」，用于把输出安全外发。
+
+    保留首字是为了还能看出类别（「某」「腾」「支」之间是有信息量的），
+    其余字符一律打码、长度保留 —— 形状可以出门，值不行。
+    这和 `scripts/bank-pdf-probe.py` 是同一个原则：数字→9、中文→字、标点保留。
+    """
+    text = str(name or "")
+    if not text:
+        return "（空）"
+    if len(text) == 1:
+        return text
+    return text[0] + "·" * (len(text) - 1)
+
+
 def print_overview(ledger, db_path: str = "") -> None:
     overall = ledger.overall()
     txn = overall["txn"]

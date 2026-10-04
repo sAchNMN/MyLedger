@@ -1,9 +1,13 @@
 """命令行入口。
 
-    python -m importer monthly                 月度批处理（推荐用法）
+    python -m importer web                     本地网页控制台（推荐日常使用）
+    python -m importer monthly                 月度批处理（命令行版）
     python -m importer review --ui             疑似重复确认（两个大按钮）
     python -m importer import <文件...>         单文件导入
     python -m importer report [--month 2026-09] 消费汇总
+    python -m importer unmatched               盘点未分类交易（按商户聚合）
+    python -m importer setcat <商户> <分类>     手工指定分类（优先级最高）
+    python -m importer recompute               按当前规则修正历史数据（默认只试算）
     python -m importer store                   查看账本存储状态
     python -m importer sources                 各渠道导出方法
     python -m importer ocr <图片...>           银行截图 → TSV（本地 OCR）
@@ -22,10 +26,11 @@ import os
 import subprocess
 import sys
 
-from . import __version__, fixups, monthly, review_ui, secure_store
+from . import __version__, fixups, monthly, review_ui, secure_store, webui
+from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
 from .model import SOURCE_LABELS
 from .pipeline import import_file
-from .render import money, print_month, print_overview
+from .render import mask_merchant, money, print_month, print_overview, table
 
 DEFAULT_VAULT = os.path.join(os.path.expanduser("~"), "MyLedgerVault")
 
@@ -137,6 +142,129 @@ def cmd_recompute(args) -> int:
             if args.strip_raw:
                 fixups.strip_raw(ledger, apply=False)
     return 0
+
+
+# --------------------------------------------------------------------------
+# unmatched —— 未分类盘点
+# --------------------------------------------------------------------------
+
+def cmd_unmatched(args) -> int:
+    """列出没被规则认出来的商户，按涉及笔数排序。
+
+    存在的理由：规则靠关键词，总会漏。要补分类就得先看清漏的是哪些商户、
+    各占多少钱 —— 盲加关键词只会把「话费充值」这类真实消费吸到错误的桶里。
+    """
+    vault = _vault(args)
+    with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+        totals = ledger.unmatched_totals(args.month)
+        rows = ledger.unmatched_merchants(args.month, limit=args.limit)
+
+        scope = args.month or "全部时间"
+        print("=" * 72)
+        print(f"未分类盘点 · {scope}")
+        print(f"  未分类交易 : {totals['n']} 笔，涉及 {totals['merchants']} 个商户")
+        print(f"  其中支出   : {money(totals['expense'])} 元")
+        if totals["income"]:
+            print(f"  其中收入   : {money(totals['income'])} 元")
+        if totals["expense_all"]:
+            share = totals["expense"] / totals["expense_all"] * 100
+            print(f"  占同期支出 : {share:.1f}%"
+                  f"（同期支出合计 {money(totals['expense_all'])} 元）")
+
+        if not rows:
+            print("\n没有未分类的交易 —— 规则覆盖得不错。")
+            return 0
+
+        print()
+        body = []
+        for r in rows:
+            name = mask_merchant(r["merchant"]) if args.mask else (r["merchant"] or "（空）")
+            body.append([name, r["n"], money(r["expense"]), money(r["income"])])
+        print(table(["商户", "笔数", "支出(元)", "收入(元)"], body,
+                    ["left", "right", "right", "right"]))
+
+        print()
+        print("归位方式（不写代码、不改规则表，按商户精确生效）：")
+        print('  python -m importer setcat "商户名" 餐饮 --apply')
+        print("可用分类：" + "、".join(CATEGORIES))
+        if args.mask:
+            print("（--mask：商户名已遮蔽，这份输出可以安全外发）")
+        return 0
+
+
+# --------------------------------------------------------------------------
+# setcat —— 手工指定分类
+# --------------------------------------------------------------------------
+
+def cmd_setcat(args) -> int:
+    """人工指定商户分类。优先级高于规则与本地 AI。
+
+    两段效果，分开说清楚：
+      1. 写「商户 → 分类」缓存表 —— 总是写、总是持久化。新导入的交易下次自动生效。
+         这一步只动一行记录，撤销成本几乎为零（--clear）。
+      2. 改已经入库的历史交易 —— **只有加 --apply 才会做**，而且做之前先备份密文。
+         因为这一步是批量改写，是全流程里少数几个真会动数据的地方。
+    """
+    vault = _vault(args)
+
+    if args.list:
+        with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+            mapping = manual_map(ledger)
+        if not mapping:
+            print("还没有人工指定的分类。")
+            return 0
+        print(f"人工指定的商户共 {len(mapping)} 个（优先级高于规则）：")
+        for merchant in sorted(mapping):
+            print(f"  {mapping[merchant]:<8} {merchant}")
+        return 0
+
+    merchant = args.merchant
+    if not merchant:
+        print("缺少商户名。用法：setcat <商户名> <分类>，或 setcat --list。")
+        return 2
+
+    if args.clear and args.category:
+        print("--clear 表示撤销人工指定，不能同时给分类。")
+        return 2
+    if not args.clear:
+        if not args.category:
+            print("缺少分类名。可用分类：" + "、".join(CATEGORIES))
+            return 2
+        if args.category not in CATEGORIES:
+            print(f"不认识的分类「{args.category}」。可用分类：" + "、".join(CATEGORIES))
+            return 2
+
+    # 改历史交易前先备份密文。备份失败就不动手。
+    if args.apply:
+        enc = secure_store.encrypted_path(vault)
+        if os.path.exists(enc):
+            fixups.backup(enc)
+
+    with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+        if args.clear:
+            removed = clear_manual(ledger, merchant)
+            print(f"已撤销「{merchant}」的人工指定，退回规则判定。"
+                  if removed else f"「{merchant}」本来就没有人工指定。")
+            category = None
+        else:
+            key = set_manual(ledger, merchant, args.category)
+            print(f"已记下缓存：{key} → {args.category}（下次导入这个商户自动用它）")
+            category = args.category
+
+        fixups.apply_manual(ledger, merchant, category, apply=args.apply)
+
+    if not args.apply:
+        print("已入库的历史交易**未改动**。确认上面的试算结果后，加 --apply 执行。")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# web —— 本地网页控制台
+# --------------------------------------------------------------------------
+
+def cmd_web(args) -> int:
+    """打开本地网页控制台。日常使用推荐这个，不用记命令。"""
+    return webui.run(_vault(args), port=args.port, open_browser=not args.no_browser)
 
 
 # --------------------------------------------------------------------------
@@ -397,6 +525,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--strip-raw", action="store_true",
                    help="顺带把历史数据里含整行原文的 raw 压成白名单形态（同样默认只试算）")
     p.set_defaults(func=cmd_recompute)
+
+    # ---- unmatched ----
+    p = _add_vault(sub.add_parser("unmatched", help="盘点未分类交易（按商户聚合）"))
+    p.add_argument("--month", help="只统计某个月，形如 2026-09")
+    p.add_argument("--limit", type=int, default=200, help="最多列出多少个商户")
+    p.add_argument("--mask", action="store_true",
+                   help="商户名遮蔽后输出，便于把结果安全外发")
+    p.set_defaults(func=cmd_unmatched)
+
+    # ---- setcat ----
+    p = _add_vault(sub.add_parser(
+        "setcat", help="手工指定某个商户的分类（优先级高于规则与本地 AI）"))
+    p.add_argument("merchant", nargs="?", help="交易对方（商户名）")
+    p.add_argument("category", nargs="?", help="分类名")
+    p.add_argument("--clear", action="store_true", help="撤销该商户的人工指定，退回规则")
+    p.add_argument("--list", action="store_true", help="列出全部人工指定的商户")
+    p.add_argument("--apply", action="store_true",
+                   help="同时改已入库的历史交易（会先备份密文）")
+    p.set_defaults(func=cmd_setcat)
+
+    # ---- web ----
+    p = _add_vault(sub.add_parser(
+        "web", help="打开本地网页控制台（不用记命令，日常推荐）"))
+    p.add_argument("--port", type=int, default=8765, help="监听端口，默认 8765")
+    p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    p.set_defaults(func=cmd_web)
 
     # ---- sources ----
     sub.add_parser("sources", help="各渠道怎么导出账单").set_defaults(func=cmd_sources)
