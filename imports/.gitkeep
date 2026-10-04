@@ -1,0 +1,7 @@
+# 真实账单导入目录。
+# 本目录下所有内容均被 .gitignore 忽略，只有本占位文件会进仓库。
+# 支付宝 / 微信 / 银行导出文件放这里，例如：
+#   imports/Alipay/alipay_record_20261004.csv
+#   imports/weixin/wechat_pay_20261004.csv
+#   imports/bank/cmb_flow_20261004.csv
+# 提交前请再确认一次：git status 里不应出现任何 imports/ 下的真实文件。

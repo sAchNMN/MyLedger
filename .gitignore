@@ -1,0 +1,96 @@
+# ===========================================================================
+# MyLedger .gitignore
+#
+# 铁律：仓库里永远只有「代码」和「假数据」。
+#      任何真实账单、密钥、凭据都不得进入 Git。
+#
+# 为什么必须这么严：Git 历史不可撤回。文件删掉、再提交一次，历史里仍有副本，
+# 任何人都能用 git log -p 完整还原。防线必须在写入之前生效。
+#
+# 完整方案见 docs/DATA-SAFETY.md
+# ===========================================================================
+
+# --- 1. 数据目录：真实账单的唯一存放地（用 .gitkeep 保留目录结构本身）---
+imports/**
+!imports/.gitkeep
+data/**
+!data/.gitkeep
+fixtures/private/**
+
+# --- 2. 账单与表格类导出物（支付宝 / 微信 / 银行）---
+*.csv
+*.tsv
+*.xls
+*.xlsx
+*.ods
+*.mdb
+*.db
+*.sqlite
+*.sqlite3
+*.sqlcipher
+
+# --- 2.1 fixtures/ 例外 ---
+# fixtures/ 是唯一允许提交的「数据」目录，里面放的是脱敏合成样例。
+# 没有它解析器没法测，所以这里必须放行。
+# 注意顺序：gitignore 是「最后匹配者生效」——
+# 先整体放行 fixtures/，再把 fixtures/private/ 重新排除掉。
+!fixtures/**
+fixtures/private/**
+
+# --- 3. 加密归档：密文本身也不进仓库 ---
+*.7z
+*.zip
+*.rar
+*.age
+*.gpg
+*.enc
+
+# --- 4. 密钥与凭据 ---
+*.key
+*.pem
+*.pfx
+*.p12
+*.jks
+*.keystore
+.env
+.env.*
+!*.env.example
+secrets/
+credentials/
+*.secret
+*.token
+
+# --- 5. 图片默认不进仓库（账单截图常含卡号与姓名）---
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.bmp
+# 代码资源与文档配图例外 —— 注意：不要把这些目录用来放账单截图
+!assets/**
+!docs/img/**
+
+# --- 6. 导出物、临时目录、日志 ---
+exports/
+out/
+tmp/
+*.log
+*.tmp
+
+# --- 7. 依赖与构建产物 ---
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+target/
+
+# --- 8. 编辑器与系统文件 ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
