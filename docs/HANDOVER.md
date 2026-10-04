@@ -49,6 +49,7 @@
 | 历史数据按新规则修正 | ✅ `recompute`，默认只试算 |
 | 未分类盘点（哪些商户没归类） | ✅ `unmatched`，商户名可遮蔽后安全外发 |
 | 手工指定分类（按商户，优先级最高） | ✅ `setcat`，可回填历史交易 |
+| 本地网页控制台（日常不用记命令） | ✅ 双击 `MyLedger.cmd`，7 个页面：概览/导入/疑似重复/报表/未分类/历史修正/帮助 |
 | 报告（月度支出构成 / 收入） | ✅ 可用 |
 
 ---
@@ -91,7 +92,9 @@ Desktop\MyLedger\                     ← Git 仓库：只有代码 + 合成假�
 │   ├── render.py        终端排版与报表
 │   ├── monthly.py       月度批处理编排
 │   ├── review_ui.py     疑似重复的本地网页确认界面
+│   ├── webui.py         本地网页控制台（7 个页面，见 §3.1）
 │   └── cli.py           命令行入口
+├── MyLedger.cmd         根目录一键启动器（双击开控制台）
 ├── scripts\
 │   ├── setup.cmd                双击装提交闸门
 │   ├── monthly.cmd              双击跑月度批处理
@@ -104,7 +107,8 @@ Desktop\MyLedger\                     ← Git 仓库：只有代码 + 合成假�
 │   ├── make_fixtures.py         生成合成账单
 │   ├── make_bank_pdf.py         生成合成**加密**银行 PDF
 │   ├── test_dedup.py            三层去重回归测试
-│   └── test_manual_category.py  分类优先级与未分类盘点的回归测试
+│   ├── test_manual_category.py  分类优先级与未分类盘点的回归测试
+│   └── test_webui.py            网页控制台边界回归（令牌 / 密码不泄露 / 并发）
 ├── fixtures\                    合成的假账单（唯一可提交的「数据」）
 └── docs\                        本文档 + 数据安全 + 导入方案
 
@@ -115,6 +119,26 @@ Desktop\MyLedger\                     ← Git 仓库：只有代码 + 合成假�
 ├── ocr\                             截图 OCR 产物
 └── logs\                            后台运行日志
 ```
+
+### 3.1 本地网页控制台（importer\webui.py）
+
+日常入口是根目录的 `MyLedger.cmd` 双击启动，浏览器自动打开 `http://127.0.0.1:<port>/?t=<token>`。
+
+不变的几条底线（设计上写死的，别为了「方便」放宽）：
+
+1. **只绑 127.0.0.1**，不提供绑别的地址的选项——绑局域网等于把账本摊给整个网络。
+2. **URI 带一次性随机令牌**，防本机其它进程「猜端口随便打」。
+3. **页面完全自包含**：零外部资源（无 CDN / 字体 / 图标库），不联网，离线可用。
+4. **zip / PDF 密码只在内存里活一次**：页面填的密码随本次任务用完即丢，
+   不进日志、任务结束就从内存清掉。控制台不提供「记住密码」。
+5. **不落任何文件**：日志只活在服务进程内存里，关掉窗口就没了。
+
+架构：一个 worker 线程 + 队列，所有会动账本的操作串行执行；
+只读查询共用一把锁，任务在跑时返回上一次快照（标 stale），界面不卡。
+
+`importer\monthly.py` 的 `run()` 为此加了三个参数：`passwords`（页面注入密码）、
+`interactive`（必须有终端时才算交互式）、`auto_review`（控制台自己处理疑似重复，
+不让服务套服务）。**cli 不传这些参数，行为完全不变。**
 
 ---
 
@@ -380,6 +404,20 @@ SQLite 去找不存在的 `-wal` 文件，**每个查询都报 `unable to open d
 改写为：撤销是明确动作，退回规则判定；规则也认不出就落到「未分类」，
 让变化可见。**同一个「保留原值」的策略，用在重算里对、用在撤销里错。**
 
+### 6.17 `.cmd` 里写中文注释会在 codepage 65001 下自毁
+
+双击 `MyLedger.cmd` 第一次跑就崩，症状是 `'�某...' 不是内部或外部命令`——
+cmd.exe 读批处理文件按「推进文件指针」的方式逐行执行，而 codepage 65001 下
+指针按**字符**推进，UTF-8 的汉字是多字节的，于是行被整行跳过或被拦腰截断，
+剩下的半截被当成命令执行。
+
+实测：`@echo off` + `chcp 65001` 下，含中文的 echo 行有概率直接从执行流里消失。
+
+**修法（已固化在 MyLedger.cmd 里）：**
+- `.cmd` / `.bat` 文件**必须是纯 ASCII**（注释用英文写在文件头），无 BOM，CRLF
+- 所有中文输出交给 Python 打印——Python 走宽字符 API 写控制台，
+  不受 cmd 指针 bug 影响（webui 用 `print(..., flush=True)` 防块缓冲）
+
 ---
 
 ## 7. 怎么证明它是对的（验证方法）
@@ -393,15 +431,17 @@ SQLite 去找不存在的 `-wal` 文件，**每个查询都报 `unable to open d
 3. **每个分支都要有专门构造的数据走过。** 现有：
    `tests/test_dedup.py`（三层去重）、`tests/make_fixtures.py`、
    `tests/make_bank_pdf.py`（合成**加密** PDF，让 PDF 链路能在不碰真实数据的前提下验通）、
-   `tests/test_manual_category.py`（分类优先级：人工 > 规则 > 原值，以及未分类盘点）。
+   `tests/test_manual_category.py`（分类优先级：人工 > 规则 > 原值，以及未分类盘点）、
+   `tests/test_webui.py`（网页控制台边界：令牌、密码不泄露、并发 409、启动器编码约定）。
 
 ---
 
 ## 8. 常用命令速查
 
 ```bash
-# 日常
-python -m importer monthly                  # 月度批处理（推荐，双击 scripts\monthly.cmd 也行）
+# 日常（推荐：双击根目录 MyLedger.cmd，浏览器自动打开网页控制台）
+python -m importer web                      # 起网页控制台（--port 8765，--no-browser 不自动开）
+python -m importer monthly                  # 月度批处理（双击 scripts\monthly.cmd 也行）
 python -m importer review --ui              # 疑似重复确认（两个大按钮）
 python -m importer report                   # 全部月份汇总
 python -m importer report --month 2026-09   # 指定月份
@@ -463,11 +503,15 @@ python -m importer setcat --clear "商户名" --apply  # 撤销，退回规则�
 7. 数据库级的更强加密（SQLCipher），等数据模型稳定后再说
 8. 报表可视化（现在是终端表格）
 
-### 最近一轮已完成
+### 最近两轮已完成
 
 - **手工指定分类** `setcat`：按商户粒度、优先级最高、可回填历史、可撤销。
 - **未分类盘点** `unmatched`：按商户聚合，`--mask` 遮蔽后输出可安全外发。
 - 两者的优先级与撤销语义见 §5.9，踩过的坑见 §6.15 / §6.16。
+- **本地网页控制台**：双击 `MyLedger.cmd` 启动，7 个页面覆盖全部日常操作，
+  不再需要记命令。架构见 §3.1，踩过的坑见 §6.17（cmd 中文截断）。
+- **边界回归测试** `tests/test_webui.py`：令牌鉴权、密码不落盘不泄露、
+  并发 409、只读接口、启动器编码约定。
 
 ---
 
