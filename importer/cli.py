@@ -128,10 +128,14 @@ def cmd_recompute(args) -> int:
             fixups.backup(enc)
         with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
             fixups.recompute(ledger, apply=True)
+            if args.strip_raw:
+                fixups.strip_raw(ledger, apply=True)
     else:
         # 试算：只读内存，退出时不写回
         with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
             fixups.recompute(ledger, apply=False)
+            if args.strip_raw:
+                fixups.strip_raw(ledger, apply=False)
     return 0
 
 
@@ -390,6 +394,8 @@ def build_parser() -> argparse.ArgumentParser:
         "recompute", help="按当前规则修正历史数据的分类与方向（默认只试算）"))
     p.add_argument("--apply", action="store_true",
                    help="真正写库（会先自动备份密文）。不加则只试算")
+    p.add_argument("--strip-raw", action="store_true",
+                   help="顺带把历史数据里含整行原文的 raw 压成白名单形态（同样默认只试算）")
     p.set_defaults(func=cmd_recompute)
 
     # ---- sources ----

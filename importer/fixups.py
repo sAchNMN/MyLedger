@@ -9,7 +9,10 @@
     并且在写库前自动备份。这是「先只读盘点、列候选、再确认」落到代码里。
 
 修正是幂等的：跑几次结果都一样，可以放心重复跑。
-只碰 direction 和 category 两列，不碰金额、时间、单号、对方、原始行。
+
+碰哪些列：
+    recompute  只碰 direction 和 category，不碰金额、时间、单号、对方、raw
+    strip_raw  只碰 raw（把老格式的整行原文压成白名单形态），不碰别的
 """
 
 from __future__ import annotations
@@ -40,6 +43,11 @@ _DIRECTION_INDEX_HINT = {"alipay": 5, "wechat": 4}
 # 这两个来源没有「收/支」列 —— 方向是按金额的正负号定的。
 # 对它们重推方向只会把数据搞坏，直接保持原样。
 _SIGN_DERIVED_SOURCES = frozenset({"bank_ocr", "bank_pdf"})
+
+# raw 里允许留下的键（与 sources._row_summary 写入的一致）。
+# strip_raw 用这张表来判断一条老 raw 需不需要整理。
+_RAW_KEEP = ("来源", "编码", "表头行", "数据行", "方向列",
+             "字段数", "非空字段数", "金额列有值", "时间列有值")
 
 
 def _derive_direction(row) -> str:
@@ -173,3 +181,101 @@ def backup(path: str, emit: Callable[[str], None] = print) -> str:
     shutil.copy2(path, target)
     emit(f"已备份到 {target}")
     return target
+
+
+# --------------------------------------------------------------------------
+# 历史 raw 的清理（ML-010）
+#
+# 改了 sources.py 只代表**新导入**的行不再存整行原文。已经入库的那些
+# 还是老格式 —— 账本里那份「账单完整副本」不会因为改了代码就自己消失。
+# 所以需要一次性的整理。
+#
+# 这一步有两个必须同时满足的约束，少一个都不能做：
+#
+#   1. 排障能力不能丢：字段数这类形状摘要要从原始行里算出来带过去
+#   2. **方向可重推的能力不能丢**：「原始」正是老格式里方向列的载体，
+#      直接删掉它，recompute 的双向性（规则改回来能还原）就断了。
+#      所以必须先把方向值搬进新格式的「方向列」，再丢掉整行。
+#
+# 而且这是改写历史数据，默认只试算。
+# --------------------------------------------------------------------------
+
+def legacy_raw_summary(raw: dict, source: str) -> tuple:
+    """把一条老格式 raw 压成白名单形态，返回 (新 raw, 方向是否仍可重推)。"""
+    keep: dict = {key: raw[key] for key in ("来源", "编码", "表头行", "数据行")
+                  if key in raw}
+    cells = raw.get("原始") or []
+
+    reversible = False
+    if "方向列" in raw:
+        keep["方向列"] = raw["方向列"]
+        reversible = True
+    elif cells:
+        # 先把方向值搬到新位置，再丢整行 —— 顺序反了就永久失去重推能力
+        idx = _DIRECTION_INDEX_HINT.get(source)
+        if idx is not None and idx < len(cells):
+            keep["方向列"] = cells[idx]
+            reversible = True
+        else:
+            for cell in cells:
+                if normalize_text(cell) in _DIRECTION_LABELS:
+                    keep["方向列"] = cell
+                    reversible = True
+                    break
+
+    if cells:
+        keep["字段数"] = len(cells)
+        keep["非空字段数"] = sum(1 for cell in cells if cell)
+    elif "字段数" in raw:
+        keep["字段数"] = raw["字段数"]
+        keep["非空字段数"] = raw.get("非空字段数", 0)
+    return keep, reversible
+
+
+def strip_raw(ledger: Ledger, apply: bool = False,
+              emit: Callable[[str], None] = print) -> dict:
+    """把历史数据里带整行原文的 raw 压成白名单形态。默认只试算。
+
+    幂等：整理过的行不会再被认作「需要整理」，跑几次结果都一样。
+    """
+    rows = ledger.conn.execute("SELECT id, source, raw FROM txn").fetchall()
+
+    changes: list[dict] = []
+    lost = 0
+    for row in rows:
+        try:
+            raw = json.loads(row["raw"])
+        except Exception:
+            continue
+        if not isinstance(raw, dict):
+            continue
+        if not any(key not in _RAW_KEEP for key in raw):
+            continue                       # 已经是白名单形态
+        keep, reversible = legacy_raw_summary(raw, row["source"])
+        if not reversible:
+            lost += 1
+        changes.append({
+            "id": row["id"],
+            "raw": json.dumps(keep, ensure_ascii=False),
+        })
+
+    emit(f"待整理的 raw：{len(changes)} 笔（全库 {len(rows)} 笔）")
+    if not changes:
+        emit("没有需要整理的记录。")
+        return {"changed": 0, "applied": False, "lost_direction": 0}
+
+    emit("  整理后只保留：来源 / 编码 / 行号 / 方向列 / 形状摘要")
+    if lost:
+        emit(f"  ！其中 {lost} 笔查不到方向值，整理后将无法再重推方向"
+             f"（当前方向不受影响）")
+
+    if not apply:
+        emit("这是试算，**没有改动任何数据**。确认无误后加 --apply 执行。")
+        return {"changed": len(changes), "applied": False, "lost_direction": lost}
+
+    for item in changes:
+        ledger.conn.execute("UPDATE txn SET raw = ? WHERE id = ?",
+                            (item["raw"], item["id"]))
+    ledger.conn.commit()
+    emit(f"已整理 {len(changes)} 笔的 raw。")
+    return {"changed": len(changes), "applied": True, "lost_direction": lost}
