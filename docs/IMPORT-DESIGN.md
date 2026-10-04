@@ -196,12 +196,22 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 │   ├── model.py       统一交易模型
 │   ├── sniff.py       编码/表头嗅探（含压缩包解包、xlsx 解析）
 │   ├── sources.py     支付宝/微信/银行 OCR 的适配器
+│   ├── pipeline.py    单文件导入流水线（cli 与 monthly 共用）
 │   ├── dedup.py       三层去重
-│   ├── store.py       SQLite
+│   ├── store.py       SQLite 层（接受外部连接，便于内存运行）
+│   ├── secure_store.py 加密存储：内存 SQLite + DPAPI 落盘
+│   ├── credentials.py  Windows DPAPI 封装（只管加解密，不存密码）
 │   ├── categorize.py  分类规则 + 本地 AI
 │   ├── power.py       电源闸门
+│   ├── render.py      终端排版与报表
+│   ├── monthly.py     月度批处理编排
+│   ├── review_ui.py   疑似重复的本地网页确认界面（两个大按钮）
 │   └── cli.py         命令行
-├── scripts\bank-ocr.ps1
+├── scripts\
+│   ├── bank-ocr.ps1           银行截图 → TSV（本地 OCR）
+│   ├── monthly.cmd            ★ 双击跑月度批处理
+│   ├── monthly-run.ps1        后台执行器（给计划任务用，带日志）
+│   └── schedule-monthly.ps1   装/卸/查 自动触发
 ├── tests\make_fixtures.py            生成合成测试账单
 └── fixtures\                         合成的假账单（唯一可提交的「数据」）
 ```
@@ -209,32 +219,190 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 命令：
 
 ```bash
-python -m importer import <文件> [--password 密码] [--ai] [--dry-run]
-python -m importer review [--resolve ID --as dup|ok]
+python -m importer monthly                  # 月度批处理（推荐）
+python -m importer review --ui              # 疑似重复确认：两个大按钮（推荐）
+python -m importer review                   # 同上，但输出在终端里
+python -m importer import <文件> [--password 密码] [--dry-run]
 python -m importer report [--month 2026-09]
-python -m importer sources          # 各渠道导出方法速查
+python -m importer store                    # 查看账本加密状态
+python -m importer sources                  # 各渠道导出方法速查
 python -m importer ocr <图片...>
+
+# 所有命令都支持 --vault <目录> 指定 vault 位置（默认 %USERPROFILE%\MyLedgerVault）
 ```
 
 只要标准库，不依赖任何第三方包——本地隐私工具装一堆第三方包本身就是额外的供应链风险。
 
 ---
 
-## 7. 每月操作流程
+## 7. 每月操作流程（已自动化到「只动手，不动脑」）
+
+### 7.1 先划清边界
+
+| 步骤 | 能不能自动 | 为什么 |
+|---|---|---|
+| 导出支付宝 / 微信账单 | ❌ **不能** | 两家都没有 API。必须你在手机 APP 里申请，微信还会发到邮箱 |
+| 截银行 APP 的交易明细 | ❌ **不能** | 银行 APP 没有导出功能，也没法脚本化截图 |
+| 解压 → 解析 → 标准化 | ✅ 能 | 纯本地逻辑 |
+| 去重 | ✅ 能 | 确定性规则 |
+| 分类 | ✅ 能 | 规则优先，结果有缓存 |
+| 归档原始文件 | ✅ 能 | 复制进 vault |
+| 出月报 | ✅ 能 | — |
+| **裁定疑似重复** | ❌ **不该自动** | 唯一需要人判断的地方。自动化的代价是可能误删真实消费 |
+
+**结论：能自动的是「文件到手之后」的全部工作；拿文件那一步只能你自己动手。**
+这不是技术缺陷，是这两家平台的现实。
+
+### 7.2 一次性准备
+
+```powershell
+# 1. 装提交闸门（如果还没装）
+scripts\setup.cmd
+
+# 2. 装自动触发（登录时跑一次，不需要管理员权限）
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1 -Action register
+```
+
+没有密码要设置——**本程序不保存你的 zip 解压密码**（见 7.5）。
+
+### 7.3 每月你要做的（只有两步）
 
 ```
-1. 支付宝导出 → 下载带密码的 zip
-2. 微信导出   → 邮箱收带密码的 zip
-3. 银行 APP  → 交易明细页截图
-4. python -m importer import <支付宝zip> --password xxx
-5. python -m importer import <微信zip>   --password xxx
-6. python -m importer ocr <截图...>
-   python -m importer import <ocr输出>*.rows.tsv --source bank
-7. python -m importer review        ← 处理疑似重复（通常 0~3 笔）
-8. python -m importer report --month 2026-10
+1. 三个渠道导出账单，全部丢进 %USERPROFILE%\MyLedgerVault\inbox\
+   （银行截图先跑一次：python -m importer ocr 截图1.png 截图2.png
+     再把输出的 *.rows.tsv 丢进 inbox）
+
+2. 双击 scripts\monthly.cmd
+   → 遇到加密 zip 会提示输一次密码，用完即忘
+   → 处理完如果发现疑似重复，**自动弹出确认界面**，点完两个大按钮即可
 ```
 
-第 7 步别跳过。那是这个方案里唯一需要你动脑的地方，也是唯一能挡住重复记账的地方。
+也就是说：**交互式跑的时候不用另外敲 review 命令**，monthly 发现疑似重复会自己把界面拉起来。
+
+后台运行不会弹（没人在场，弹窗口只会干扰），它只提示你「登录后手动跑一次」。
+
+想关掉自动弹窗：`python -m importer monthly --no-review`。
+
+这一步别跳过——**它是全流程唯一能挡住重复记账的地方**。手动补跑：
+
+```
+python -m importer review --ui
+```
+
+### 7.4 自动化是怎么触发的
+
+默认用**登录时触发**（在「启动」文件夹放一个快捷方式），不是定时任务。
+
+理由：这条流水线是**幂等**的——同一份文件重复导入不会重复记账（L1 按「同源 + 同交易单号」跳过），
+所以「跑得频繁」零副作用。登录触发比定时触发可靠得多，笔记本也不存在「到点关机就跳过」的问题，
+更不会为了跑一个几秒钟的脚本去唤醒机器。
+
+想改成每天定时：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1 -Action register -Daily -Time 09:00
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1 -Action status
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\schedule-monthly.ps1 -Action remove
+```
+
+后台运行的输出会追加到 `%USERPROFILE%\MyLedgerVault\logs\monthly-YYYYMM.log`。
+**自动化的日志是必需品**——没人在旁边看的时候，出问题你只有这份日志可查。
+
+### 7.5 关于密码：只输一次，用完即忘
+
+**本程序不保存你的 zip 解压密码。** 交互式运行（双击 `monthly.cmd`）时，
+每个渠道提示输入一次，输完立刻从内存丢弃——不写文件、不留缓存、不进日志。
+
+**这带来一个必须接受的后果：后台自动运行处理不了加密 zip。**
+
+```
+后台任务启动
+  ├── 已解压的 csv / xlsx  → 正常导入（这些文件本来就没有密码）
+  └── 加密 zip             → 跳过，留在原地并提示「登录后手动跑一次 monthly.cmd」
+```
+
+这是「不记密码」的必然结果，不是缺陷。两条路选一条：
+
+| 想要的效果 | 怎么做 |
+|---|---|
+| 后台全自动 | 自己解压出 csv，把 csv 丢进投递目录 |
+| 省事（zip 直接丢） | 保持现状，每月手动双击一次 `monthly.cmd` 输密码 |
+
+代码上这条约束是硬编码的：`credentials.py` 里除了 DPAPI 加解密，
+**根本不提供「保存密码」这个能力**——不给的能力就不会被误用。
+
+### 7.6 账号数据怎么存的：加密落盘，明文不碰硬盘
+
+账本不是普通 SQLite 文件，是加密的。做法：
+
+```
+打开：读 ledger.db.enc → DPAPI 解密 → 装进内存 → 全程在内存里操作
+退出：从内存序列化 → DPAPI 加密 → 原子写回 ledger.db.enc
+```
+
+三个关键点：
+
+1. **明文一秒都不落盘。** 不是「加密文件 + 运行时解密到临时文件」那套——
+   那套会在硬盘上留下明文副本，恰好是要防的东西。内存方案没有这个窗口。
+2. **没有第三方依赖。** 没有 SQLCipher，也没有自己手写的 AES。DPAPI 是操作系统提供的。
+3. **不用再记一个密码。** 你已经明确要求 zip 密码用完即忘，再让你记一个数据库密码是自相矛盾的。
+
+**代价必须知道：** 密钥由 Windows 用户账户派生，所以**重装系统或换 Windows 账户后这个库解不开**。
+兜底手段是 `vault\raw\` 里的原始账单归档——真出事了重新导一遍即可。
+
+查看存储状态：
+
+```bash
+python -m importer store
+```
+
+它会明确告诉你加密库在哪、多大，以及是否存在遗留的明文库（有的话会催你删掉）。
+
+### 7.7 裁定界面：两个大按钮
+
+```bash
+python -m importer review --ui
+```
+
+终端里做不到「按钮」这个交互——长单号和商户名对齐很难看，y/n 也快不起来。
+所以做成了一个**本地网页**：一次只出一笔，两笔交易左右并排，**差异字段高亮**，
+下面两个大按钮：
+
+```
+[ 1  是同一笔          ]    [ 2  是两笔独立交易   ]
+   从统计里剔除这一笔           保留两笔，以后不再提示
+```
+
+键盘 `1` / `2`（或 `←` / `→`）即可，手不用离开键盘。审完自动关服务。
+
+**触发方式有两个：**
+
+- 交互式跑 `monthly` 时发现疑似重复 → **自动拉起**（不用另敲命令）
+- 手动补跑：`python -m importer review --ui`
+
+两者用的是同一份账本连接。自动拉起发生在账本加密落盘**之前**，
+所以界面里的裁定会跟这次导入的结果一起写进 `ledger.db.enc`。
+
+安全上：
+
+- **只绑 `127.0.0.1`**，局域网访问不到；代码里直接拒绝绑定其它地址
+- URI 里带一次性随机令牌，本机其它进程猜到端口也动不了你的账本
+- 页面完全自包含，**不引任何外部资源、不联网**
+- 不落任何文件，页面是现生成的
+
+两个按钮都只改数据库里的 `review` 标记，**不删除任何记录**：
+`confirmed_dup` 从统计里剔除（原始行仍在库里），`confirmed_ok` 以后不再提示。
+
+### 7.8 为什么不用 AI agent 做这件事
+
+整条流水线只需要几秒，全程离线。让一个 AI 会话每天启动来做它，只多耗电、不多出任何价值。
+
+**AI 在这条链路里只出现在一个位置：商户名 → 消费分类的兜底**，而且：
+- 得手动加 `--ai` 才启用（默认关闭）
+- 必须插电（`power.py` 拦截）
+- 结果写进 `merchant_category` 缓存，同一个商户只问一次
+
+绝大多数月份，规则 + 缓存就能覆盖全部流水，一次模型都不用调。
 
 ---
 
@@ -255,6 +423,23 @@ python -m importer ocr <图片...>
 | 分类规则 | 餐饮/交通/日用百货/转账还款/退款 均正确 |
 | 人工裁定 `--resolve` | 生效，报表实时反映 |
 | 纯标准库 | `compileall` 通过，无第三方依赖 |
+| DPAPI 加解密往返 | 17 字符明文 → 262 字节密文 → 还原一致；明文不出现在密文里 |
+| 密码托管存储 | `.credentials` 里只有 DPAPI 密文的 base64，grep 不到明文 |
+| 非交互终端下 `password set` | 正确挡下并提示，不阻塞（退出码 2） |
+| `monthly` 空投递目录 | 友好提示，退出码 0 |
+| `monthly` 批处理 | 2 成功 / 1 失败（残缺文件），失败文件留在原地 |
+| `monthly` 幂等 | 第二次运行只剩未处理的残缺文件 |
+| `monthly --vault` 隔离 | 数据库正确落在指定 vault，不污染默认位置 |
+| 5 个 PowerShell 脚本 | 语法检查全过，中文无乱码 |
+| 旧命令回归 | `import` / `report` 行为不变 |
+| 加密存储落盘 | `ledger.db.enc` 无 SQLite 魔数、`sqlite3` 打不开、grep 不到明文商户名 |
+| 加密存储重开 | 关掉再打开，8 笔数据完整读回，报表一致 |
+| 加密库跨线程写 | 网页界面每个请求一个线程，裁定全部 HTTP 200 |
+| 明文库迁移 | WAL 明文库自动迁移，2 笔数据完整搬到加密库 |
+| `review --ui` 页面 | 含两个大按钮与快捷键说明；**不引任何外部资源** |
+| `review --ui` 鉴权 | 无令牌访问 `/state` 返回 403 |
+| `review --ui` 裁定 | 裁定写库正确，报表实时反映（餐饮 145.50→117.00） |
+| 加密 zip 后台跳过 | `_needs_password` 判定 True，明确提示并留在原地 |
 
 **未验证（需要你本人操作）：**
 
@@ -262,7 +447,38 @@ python -m importer ocr <图片...>
 - 真实的 87 笔微信账单（当前手上是残缺文件，需重新导出）
 - 本地 AI 分类（未装 Ollama）
 - 银行截图 OCR（需要真实的银行 APP 截图）
-- `--ai` 的电源闸门实际拦截效果
+- Windows 计划任务注册（需要你执行 `schedule-monthly.ps1 -Action register`）
+- DPAPI 密文在换机器后确实解不开（逻辑上必然，但没有第二台机器实测）
+- **浏览器里的实际观感**——HTML 结构、两个按钮、快捷键都验过了，
+  但没人真的用眼睛看过这个页面长什么样
+
+**修掉的问题**（都是实测撞出来的，分批记录）：
+
+*第一批（导入器）*
+
+1. `--vault` 只换了 vault、没换数据库路径——数据库仍写死指向默认 vault。
+   表现是「测试参数看着生效了，数据却写进了真实账本」。数据库路径一律由 vault 推导。
+2. `inbox\说明.txt` 被当成账单文件，每次运行都多报一条失败，把真正的失败淹掉。
+   `.txt` 已从识别后缀里去掉，说明文件单独排除。
+3. `password set` 在非交互终端下**直接卡住**：Windows 的 `getpass` 走 `msvcrt`
+   读控制台，不看 stdin，管道输入喂不进去。已加 `isatty()` 前置判断。
+4. 报表前多打了一行分隔线（重复输出）。
+
+*第二批（加密存储 + 网页界面）*
+
+5. **从 WAL 明文库迁移时，`deserialize()` 必然把连接搞坏。**
+   WAL 模式库 `serialize()` 出来的镜像，文件头读写版本字节仍标着 WAL；
+   装进内存库后 SQLite 去找不存在的 `-wal` 文件，**每一个查询都报
+   `unable to open database file`**。阴险的地方是 `deserialize()` 本身不报错，
+   错误延迟到第一次查询才出现。修法：序列化前先 `PRAGMA journal_mode = DELETE`。
+   纯内存往返不会触发，所以第一轮测试全绿、只有迁移路径炸。
+6. **`disable_journal_mode` 顺带修掉一个数据丢失隐患**：不 checkpoint 就 serialize，
+   会丢掉 WAL 里尚未并回主库的那部分数据。
+7. **网页界面跨线程用 sqlite 连接**：`ThreadingHTTPServer` 每个请求开新线程，
+   而连接建在主线程，Python 默认禁止跨线程使用，点一次按钮就抛
+   `SQLite objects created in a thread can only be used in that same thread`。
+   修法：`check_same_thread=False` + 一把锁守住所有账本操作。
+8. 去掉了「保存 zip 密码」的全部代码路径——**不给的能力就不会被误用**。
 
 ---
 
@@ -277,3 +493,7 @@ python -m importer ocr <图片...>
 | 用 openpyxl 等第三方库读 xlsx | 多一个依赖多一份供应链风险；xlsx 是 zip+XML，标准库够用 |
 | 明文存原始账单 | 原始文件归档进 vault，跟账本同一个安全区 |
 | 导入时不校验笔数 | 残缺文件会静默记成「本月零支出」 |
+| **保存账单 zip 密码** | 你要求用完即忘。代码里干脆不提供这个能力，不给就不会被误用 |
+| **自己写 AES 加密数据库** | 密钥还是得存在同一台机器上，等于没加密。用系统提供的 DPAPI |
+| **运行时解密数据库到临时文件** | 会在硬盘上留下明文副本，恰好是要防的东西。改成全程内存 |
+| 把 review 界面做成需要联网的网页 | 只绑 127.0.0.1、不引外部资源、不落文件 |
