@@ -86,6 +86,14 @@ PAGE = r"""<!DOCTYPE html>
   .done { text-align: center; padding: 60px 20px; }
   .done h2 { font-size: 22px; font-weight: 500; }
   .done p { color: var(--muted); font-size: 14px; }
+  .notice { max-width: 1000px; margin: 16px auto 0; padding: 12px 16px;
+            border-radius: 10px; font-size: 14px; line-height: 1.6;
+            background: #fdecea; border: 1px solid #f3b6b0; color: #7a1c15;
+            display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+  .notice[hidden] { display: none; }
+  .notice button { border: 1px solid currentColor; background: transparent;
+                   color: inherit; border-radius: 8px; padding: 4px 12px;
+                   font-size: 13px; cursor: pointer; font-family: inherit; }
   footer { text-align: center; color: var(--muted); font-size: 12px;
            padding: 24px; }
   .empty { text-align: center; padding: 60px; color: var(--muted); }
@@ -100,6 +108,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="progress">按 <b>1</b> = 同一笔 &nbsp;·&nbsp; 按 <b>2</b> = 两笔独立</div>
 </header>
 <div class="bar"><i id="bar" style="width:0%"></i></div>
+<div class="notice" id="err" hidden></div>
 <main id="main"><div class="empty">正在加载…</div></main>
 <footer>所有裁定只改标记，不删除任何记录。关掉本页即可，改动已即时保存。</footer>
 
@@ -162,19 +171,74 @@ function render() {
     "</div>";
 }
 
+// 后端的固定错误码 → 给人看的话。
+// 「永久性」的失败（这条已经不在列表里、不是待复核、已经裁定过）
+// 重试一万次也不会成功，所以给一个「跳过这条」的出口；
+// 网络抖动和服务端 5xx 只提示重试 —— 那两种真的会自己好。
+const PERMANENT = {
+  "not_found": "这条已经不在待确认列表里了（可能被另一个窗口处理过）。",
+  "not_reviewable": "这条不是「疑似重复」，不能在这里裁定。",
+  "already_decided": "这条已经裁定过了，不能翻案。"
+};
+
+function showError(text, canSkip) {
+  const box = document.getElementById("err");
+  box.innerHTML = "<span>" + esc(text) + "</span>" +
+    (canSkip ? "<button onclick='skipCurrent()'>跳过这条</button>" : "");
+  box.hidden = false;
+}
+
+function clearError() {
+  const box = document.getElementById("err");
+  box.hidden = true;
+  box.innerHTML = "";
+}
+
+function skipCurrent() {
+  clearError();
+  idx++;
+  render();
+}
+
 async function decide(decision) {
   if (deciding || idx >= items.length) return;
   deciding = true;
+  clearError();
   const it = items[idx];
+  let failure = null;
   try {
-    await fetch("/decide?t=" + encodeURIComponent(TOKEN), {
+    const response = await fetch("/decide?t=" + encodeURIComponent(TOKEN), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id: it.id, decision: decision })
     });
-  } catch (e) { /* 本地服务关了也无所谓，改动已落库 */ }
-  idx++;
+
+    // fetch 只在网络层失败时抛异常 —— HTTP 400/403/404/409/500 都会正常返回。
+    // 不检查 response.ok 的话，「没改成功」和「改好了」在代码里长得一模一样，
+    // 页面照样跳到下一条，用户以为这一笔记下了，裁定其实已经丢了。
+    if (!response.ok) {
+      let code = "";
+      try {
+        const body = await response.json();
+        code = (body && body.error) || "";
+      } catch (e) { code = ""; }
+      failure = {
+        permanent: Boolean(PERMANENT[code]),
+        text: PERMANENT[code] || ("裁定没有保存（HTTP " + response.status + "），请重试。")
+      };
+    }
+  } catch (e) {
+    failure = { permanent: false, text: "连不上本地服务，裁定没有保存。请重试。" };
+  }
+
   deciding = false;
+  if (failure) {
+    // 索引不动：当前这条留在屏幕上等重试或手动跳过。
+    // 这里千万不能 idx++ —— 那正是「请求失败仍然跳过当前记录」的老毛病。
+    showError(failure.text, failure.permanent);
+    return;
+  }
+  idx++;
   render();
 }
 
@@ -184,9 +248,17 @@ document.addEventListener("keydown", (e) => {
 });
 
 (async function load() {
-  const r = await fetch("/state?t=" + encodeURIComponent(TOKEN));
-  const d = await r.json();
-  items = d.items || [];
+  try {
+    const r = await fetch("/state?t=" + encodeURIComponent(TOKEN));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const d = await r.json();
+    items = d.items || [];
+  } catch (e) {
+    document.getElementById("main").innerHTML =
+      "<div class='empty'>读不到待确认列表：连不上本地服务。<br>" +
+      "关掉本页，重新运行一次确认界面即可。</div>";
+    return;
+  }
   render();
 })();
 </script>

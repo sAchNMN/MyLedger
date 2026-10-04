@@ -70,10 +70,14 @@ P2/P3、依赖锁定、测试入口统一等工程化项**本轮不动**。
 
 | 块 | 内容 | 涉及文件 | 状态 |
 |---|---|---|---|
-| C1 | `/decide` 明确契约：`ok/id/updated`、`404 not_found`、幂等；`resolve` 加守卫 | `importer/review_ui.py`、`importer/store.py` | ⬜ |
-| C2 | 前端检查 `response.ok`，失败保留当前条并提示，防止重复提交 | `importer/review_ui.py` | ⬜ |
+| C1 | `/decide` 明确契约：`ok/id/updated`、`404 not_found`、幂等；`resolve` 加守卫 | `importer/review_ui.py`、`importer/store.py` | ✅ |
+| C2 | 前端检查 `response.ok`，失败保留当前条并提示，防止重复提交 | `importer/review_ui.py` | ✅ |
+| C0 | （测试抓出来的额外缺陷）重复提交重复计数、提交次数一到就提前关界面 | `importer/review_ui.py` | ✅ |
 
 验收（合成数据）：模拟 200 / 400 / 404 / 403 / 500 / 重复提交，只有 200 才前进一条。
+**已通过**：`tests/test_review_api.py`（真实 HTTP 打后端）、
+`tests/test_review_ui_js.py`（Node 里真跑页面脚本，11 个场景；
+反向验证过它抓得住 HEAD 版本的缺陷）。
 
 ### 阶段 D —— ML-009 明文数据库迁移后仍然保留（P1）
 
