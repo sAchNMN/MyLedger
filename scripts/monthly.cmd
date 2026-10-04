@@ -14,9 +14,15 @@ setlocal enabledelayedexpansion
 
 set "REPO=%~dp0.."
 set "PYEXE="
+set "VENV_PY=%USERPROFILE%\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
 
-rem Prefer python on PATH, fall back to the managed interpreter.
-where python >nul 2>nul && set "PYEXE=python"
+rem Prefer the isolated venv interpreter. PDF statement support needs PyMuPDF,
+rem which is installed there; falling back to a bare python would turn every
+rem PDF import into a confusing "no PDF library" error.
+if exist "%VENV_PY%" set "PYEXE=%VENV_PY%"
+if not defined PYEXE (
+  where python >nul 2>nul && set "PYEXE=python"
+)
 if not defined PYEXE (
   if exist "%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe" (
     set "PYEXE=%USERPROFILE%\.workbuddy\binaries\python\versions\3.13.12\python.exe"

@@ -310,7 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = _add_vault(sub.add_parser("import", help="导入单个账单文件"))
     p.add_argument("files", nargs="+", help="账单文件（支持 csv/xlsx/带密码的 zip）")
     p.add_argument("--source", default="auto",
-                   choices=["auto", "alipay", "wechat", "bank"],
+                   choices=["auto", "alipay", "wechat", "bank", "bank_pdf"],
                    help="数据源，默认按文件名和表头自动识别")
     p.add_argument("--password", default=None,
                    help="压缩包密码。不传则在交互式终端里提示输入（用完即忘，不保存）")

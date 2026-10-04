@@ -32,6 +32,10 @@ $LogFile = Join-Path $LogDir ("monthly-{0:yyyyMM}.log" -f (Get-Date))
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Get-PythonExe {
+    # 优先用隔离 venv 的解释器：PDF 账单解析依赖装在里面的 PyMuPDF。
+    # 退回裸 python 的话，每次 PDF 导入都会变成一句看不懂的「没有 PDF 库」。
+    $venv = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\envs\default\Scripts\python.exe'
+    if (Test-Path -LiteralPath $venv) { return $venv }
     $cmd = Get-Command python -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
     $managed = Join-Path $env:USERPROFILE '.workbuddy\binaries\python\versions\3.13.12\python.exe'

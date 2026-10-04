@@ -153,7 +153,12 @@ def parse_excel_serial(value: float) -> Optional[datetime]:
 # 交易
 # --------------------------------------------------------------------------
 
-SOURCE_LABELS = {"alipay": "支付宝", "wechat": "微信", "bank_ocr": "银行卡截图"}
+SOURCE_LABELS = {
+    "alipay": "支付宝",
+    "wechat": "微信",
+    "bank_ocr": "银行卡截图",
+    "bank_pdf": "银行卡PDF",
+}
 
 
 @dataclass

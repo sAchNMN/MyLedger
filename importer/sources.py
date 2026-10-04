@@ -207,7 +207,8 @@ def parse_bank_ocr(tsv_path: str, password: Optional[str] = None) -> ParseResult
     # _parse_rows 找不到表头时会返回「整份文件里找不到表头行」，这时改用自动识别
     if result.txns or not result.skipped or "找不到表头行" not in result.skipped[0].get("reason", ""):
         return result
-    return _parse_bank_rows_auto(tsv_path)
+    rows, encoding, origin = load_table(tsv_path, None)
+    return _parse_bank_rows_auto(rows, tsv_path, origin=origin, encoding=encoding)
 
 
 # --------------------------------------------------------------------------
@@ -259,10 +260,10 @@ def _extract_dates(text: str) -> list:
     return out
 
 
-def _parse_bank_rows_auto(tsv_path: str, default_year: Optional[int] = None) -> ParseResult:
+def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
+                          origin: str = "", encoding: str = "") -> ParseResult:
     from .model import DIRECTION_EXPENSE, DIRECTION_INCOME, DIRECTION_NEUTRAL
 
-    rows, encoding, origin = load_table(tsv_path, None)
     now = dt.datetime.now()
     year = default_year or now.year
 
@@ -394,8 +395,25 @@ def _parse_bank_rows_auto(tsv_path: str, default_year: Optional[int] = None) -> 
         txns=txns,
         declared_count=None,      # 截图没有「共 N 笔」自述
         skipped=skipped,
-        path=tsv_path,
+        path=path,
     )
+
+
+def parse_bank_pdf(path: str, password: Optional[str] = None) -> ParseResult:
+    """加密 PDF 银行账单。
+
+    这是银行流水最靠谱的一条路：PDF 的文字是结构化存储的，
+    抽出来是精确字符 + 精确坐标，没有 OCR 的识别误差。
+    """
+    from .bank_pdf import extract_rows
+
+    rows, meta = extract_rows(path, password)
+    notes = [f"PDF {meta['pages']} 页"]
+    if meta.get("encrypted"):
+        notes.append("已用密码解密")
+    result = _parse_bank_rows_auto(rows, path, origin="、".join(notes))
+    result.source = "bank_pdf"
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -409,6 +427,11 @@ def detect_source(path: str) -> str:
     所以这里用启发式判断是安全的。
     """
     name = path.lower()
+
+    # PDF 一律当银行账单。支付宝/微信导出的是 csv/xlsx/zip，不会是 PDF。
+    if name.endswith(".pdf"):
+        return "bank_pdf"
+
     if "支付宝" in name or "alipay" in name:
         return "alipay"
     if "微信" in name or "wechat" in name or "wxpay" in name or "tenpay" in name:
@@ -434,4 +457,5 @@ PARSERS = {
     "alipay": parse_alipay,
     "wechat": parse_wechat,
     "bank_ocr": parse_bank_ocr,
+    "bank_pdf": parse_bank_pdf,
 }

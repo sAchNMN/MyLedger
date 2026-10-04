@@ -73,11 +73,29 @@ SQLite（在 vault 里，仓库外）→ 月报
 
 ### 银行卡
 
-银行 APP 没有导出功能，只能截图。截图要求：
+**首选：加密 PDF。** 有些银行支持「发送账单到邮箱 / 导出交易明细」，导出的是加密 PDF。
+这是最靠谱的一条路，原因很直接：
+
+| | 截图 + OCR | 加密 PDF |
+|---|---|---|
+| 文字来源 | 靠引擎**猜**字形 | 结构化存储，**精确字符** |
+| 出错方式 | 糊一个字符，金额就错，且不报错 | 不会读错 |
+| 坐标 | 靠 OCR 估 | 精确，能还原列 |
+| 日期 | **实测整列读不出来** | 正常读出 |
+
+导入方式：PDF 丢进 `inbox\`，跑 `monthly.cmd`，提示时输一次密码（用完即忘）。
+
+**兜底：截图 + 本地 OCR。** 银行 APP 没有导出功能时才走这条。
+截图要求：
 
 - 用银行 APP 的「交易明细」页，**不要**用首页的缩略列表（那条没有时间/对方字段）
-- 一屏一张图，**不要把一笔交易截断在两屏之间**
+- **一屏一张图，别用滚动截长图。** 长截图每笔占的像素太少，
+  实测一张 1216×9456 的长图，OCR 连一个冒号、一个日期分隔符都没读出来
 - 每笔交易至少能看到：时间、交易对方、金额、收支方向
+
+> 关于截图这条路的结论：**能自动读金额，读不出日期**。没有日期就没有月份归属，
+> 记进去等于把月报表搞错，所以导入器会在解析到 0 笔时直接拒绝。
+> 遇到这种情况请改用 PDF 导出，或者放大后分屏截图。
 
 ### 一个必须知道的失败模式
 
@@ -195,7 +213,8 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 ├── importer\
 │   ├── model.py       统一交易模型
 │   ├── sniff.py       编码/表头嗅探（含压缩包解包、xlsx 解析）
-│   ├── sources.py     支付宝/微信/银行 OCR 的适配器
+│   ├── sources.py     支付宝/微信/银行 的适配器与字段识别
+│   ├── bank_pdf.py    加密 PDF 抽取（PyMuPDF，按坐标还原行与列）
 │   ├── pipeline.py    单文件导入流水线（cli 与 monthly 共用）
 │   ├── dedup.py       三层去重
 │   ├── store.py       SQLite 层（接受外部连接，便于内存运行）
@@ -209,10 +228,13 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 │   └── cli.py         命令行
 ├── scripts\
 │   ├── bank-ocr.ps1           银行截图 → TSV（本地 OCR）
+│   ├── bank-pdf-probe.py      ★ PDF 结构探针（输出全部脱敏，可安全外发）
 │   ├── monthly.cmd            ★ 双击跑月度批处理
 │   ├── monthly-run.ps1        后台执行器（给计划任务用，带日志）
 │   └── schedule-monthly.ps1   装/卸/查 自动触发
-├── tests\make_fixtures.py            生成合成测试账单
+├── tests\
+│   ├── make_fixtures.py       生成合成账单（支付宝 / 微信 / 残缺样本）
+│   └── make_bank_pdf.py       生成合成**加密**银行 PDF
 └── fixtures\                         合成的假账单（唯一可提交的「数据」）
 ```
 
@@ -228,8 +250,15 @@ python -m importer store                    # 查看账本加密状态
 python -m importer sources                  # 各渠道导出方法速查
 python -m importer ocr <图片...>
 
+# PDF 结构探针（换银行时先跑这个，输出全部脱敏，可安全外发）
+<venv>\Scripts\python.exe scripts\bank-pdf-probe.py "账单.pdf"
+
 # 所有命令都支持 --vault <目录> 指定 vault 位置（默认 %USERPROFILE%\MyLedgerVault）
 ```
+
+**关于依赖**：整条链路原本是纯标准库。PDF 那一步做不到——PDF 解密必须有库。
+所以引入了 **PyMuPDF**（装在隔离 venv 里，不碰系统 Python），并配了 **pypdf** 作备选。
+其余部分仍然是纯标准库。`scripts\monthly.cmd` 会优先用带这两个库的解释器。
 
 只要标准库，不依赖任何第三方包——本地隐私工具装一堆第三方包本身就是额外的供应链风险。
 

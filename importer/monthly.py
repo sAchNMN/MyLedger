@@ -51,9 +51,11 @@ DONE_DIRNAME = "_done"
 #   投递目录里会放一个「说明.txt」当使用指引，.txt 认进来会让每次运行
 #   都多报一条失败，把真正的失败淹掉。银行 OCR 产出的是 .rows.tsv，
 #   支付宝/微信的内层文件是 csv/xlsx，都不需要 .txt。
-SUFFIXES = (".zip", ".csv", ".tsv", ".xlsx", ".xlsm")
+SUFFIXES = (".zip", ".csv", ".tsv", ".xlsx", ".xlsm", ".pdf")
 
 IGNORED_NAMES = ("说明.txt", "README.txt", "README.md", "readme.md")
+
+SOURCE_LABELS_EXTRA = {"bank_pdf": "银行卡PDF"}
 
 INBOX_README = """把待处理的账单文件丢进这个目录，然后双击 scripts\\monthly.cmd
 
@@ -109,12 +111,20 @@ def scan_inbox(vault: str) -> list:
 
 
 def _needs_password(path: str) -> bool:
-    """这个 zip 是否带密码。
+    """这个文件需不需要密码。
 
-    不能靠「试着解压失败」判断——那要先把文件读一遍，慢且不必要。
-    zip 的中央目录里每一位都带加密标志，直接读标志最快最准。
+    zip：读中央目录里的加密标志，最快最准。
+    PDF：问 PyMuPDF 的 needs_pass。
+    都不能靠「试着打开失败」判断——那要先把文件读一遍，慢且不必要。
     """
     try:
+        if path.lower().endswith(".pdf"):
+            from .bank_pdf import _require_pymupdf
+            pymupdf = _require_pymupdf()
+            doc = pymupdf.open(path)
+            need = bool(getattr(doc, "needs_pass", False))
+            doc.close()
+            return need
         if not zipfile.is_zipfile(path):
             return False
         with zipfile.ZipFile(path) as zf:
@@ -123,13 +133,13 @@ def _needs_password(path: str) -> bool:
         return False
 
 
-def _prompt_password(label: str) -> Optional[str]:
-    """交互式索取 zip 密码。拿不到就返回 None，绝不猜、绝不回退到空密码。"""
+def _prompt_password(label: str, kind: str = "压缩包") -> Optional[str]:
+    """交互式索取密码。拿不到就返回 None，绝不猜、绝不回退到空密码。"""
     if not sys.stdin.isatty():
         return None
     try:
         return getpass.getpass(
-            f"  {label}账单的解压密码（不回显，用完即忘，不保存；直接回车跳过）："
+            f"  {label}账单的{kind}密码（不回显，用完即忘，不保存；直接回车跳过）："
         )
     except (KeyboardInterrupt, EOFError):
         print()
@@ -204,24 +214,26 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
                 fail.append((path, "无法识别数据源"))
                 continue
 
-            label = {"alipay": "支付宝", "wechat": "微信", "bank_ocr": "银行截图"}.get(source, source)
+            label = {"alipay": "支付宝", "wechat": "微信",
+                     "bank_ocr": "银行截图", "bank_pdf": "银行卡PDF"}.get(source, source)
             print(f"  识别为：{label}")
 
             password = session_passwords.get(source)
             if _needs_password(path):
+                kind = "PDF" if path.lower().endswith(".pdf") else "压缩包"
                 if password is None:
-                    password = _prompt_password(label)
+                    password = _prompt_password(label, kind)
                     if password:
                         session_passwords[source] = password
                 if not password:
                     if interactive:
                         print("  未输入密码，跳过。文件留在原地。")
-                        fail.append((path, "需要解压密码但没有输入"))
+                        fail.append((path, "需要密码但没有输入"))
                     else:
-                        print("  这是加密 zip，后台运行没法输密码。")
+                        print(f"  这是加密 {kind}，后台运行没法输密码。")
                         print("  处理办法：登录后双击 scripts\\monthly.cmd 手动跑一次；")
-                        print("            或者自己解压出 csv，把 csv 丢进投递目录。")
-                        fail.append((path, "加密 zip 需要交互输入密码"))
+                        print("            或者自己解开后把 csv 丢进投递目录。")
+                        fail.append((path, f"加密 {kind} 需要交互输入密码"))
                     continue
 
             outcome = import_file(
