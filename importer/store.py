@@ -281,6 +281,71 @@ class Ledger:
         ).fetchone()
         return rows
 
+    # ------------------------------------------------------------------
+    # 未分类盘点
+    #
+    # 「未分类占比不低」是这个项目已知的数据质量问题：规则靠关键词，
+    # 总有认不出来的商户。要补规则/补人工指定，第一步得先看清
+    # 「到底是哪些商户没分类、各占多少钱」——盲补关键词只会按倒葫芦起了瓢。
+    # ------------------------------------------------------------------
+
+    def unmatched_merchants(self, month: Optional[str] = None,
+                            limit: int = 200) -> list[sqlite3.Row]:
+        """按商户聚合未分类交易，笔数多的排前面。
+
+        支出/收入/中性分开汇总：未分类里既有真消费，也有没归好类的进账，
+        混成一个数会误导（生活费进账不是「这笔消费没分类」）。
+        """
+        where = ["category = '未分类'", "review != 'confirmed_dup'"]
+        params: list = []
+        if month:
+            where.append("substr(ts,1,7) = ?")
+            params.append(month)
+        params.append(limit)
+        return self.conn.execute(
+            "SELECT counterparty AS merchant, COUNT(*) AS n,"
+            " SUM(CASE WHEN direction='expense' THEN CAST(amount AS REAL) ELSE 0 END) AS expense,"
+            " SUM(CASE WHEN direction='income'  THEN CAST(amount AS REAL) ELSE 0 END) AS income,"
+            " SUM(CASE WHEN direction='neutral' THEN CAST(amount AS REAL) ELSE 0 END) AS neutral,"
+            " SUM(CAST(amount AS REAL)) AS total,"
+            " MIN(ts) AS first_ts, MAX(ts) AS last_ts"
+            " FROM txn WHERE " + " AND ".join(where) +
+            " GROUP BY counterparty ORDER BY n DESC, total DESC LIMIT ?",
+            params,
+        ).fetchall()
+
+    def unmatched_totals(self, month: Optional[str] = None) -> dict:
+        """未分类的总量，以及占同期支出的比例。"""
+        where = ["category = '未分类'", "review != 'confirmed_dup'"]
+        exp_where = ["direction = 'expense'", "review != 'confirmed_dup'"]
+        params: list = []
+        exp_params: list = []
+        if month:
+            where.append("substr(ts,1,7) = ?")
+            params.append(month)
+            exp_where.append("substr(ts,1,7) = ?")
+            exp_params.append(month)
+
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS n, COUNT(DISTINCT counterparty) AS merchants,"
+            " SUM(CASE WHEN direction='expense' THEN CAST(amount AS REAL) ELSE 0 END) AS expense,"
+            " SUM(CASE WHEN direction='income'  THEN CAST(amount AS REAL) ELSE 0 END) AS income"
+            " FROM txn WHERE " + " AND ".join(where),
+            params,
+        ).fetchone()
+        expense_all = self.conn.execute(
+            "SELECT SUM(CAST(amount AS REAL)) AS v FROM txn WHERE " + " AND ".join(exp_where),
+            exp_params,
+        ).fetchone()["v"] or 0.0
+
+        return {
+            "n": row["n"] or 0,
+            "merchants": row["merchants"] or 0,
+            "expense": row["expense"] or 0.0,
+            "income": row["income"] or 0.0,
+            "expense_all": expense_all,
+        }
+
     def resolve(self, txn_id: int, decision: str, note: str = "") -> bool:
         """人工裁定。decision = confirmed_dup | confirmed_ok。"""
         if decision not in ("confirmed_dup", "confirmed_ok"):

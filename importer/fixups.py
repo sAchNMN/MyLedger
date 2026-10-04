@@ -19,9 +19,15 @@ import shutil
 import sqlite3
 from collections import Counter
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Optional
 
-from .categorize import NON_CONSUMPTION_CATEGORIES, classify_by_rules
+from .categorize import (
+    DEFAULT_CATEGORY,
+    NON_CONSUMPTION_CATEGORIES,
+    category_for,
+    classify_by_rules,
+    manual_map,
+)
 from .model import DIRECTION_EXPENSE, DIRECTION_NEUTRAL, normalize_text, parse_direction
 from .store import Ledger
 
@@ -89,14 +95,22 @@ def recompute(ledger: Ledger, apply: bool = False,
     """按当前规则重算分类与方向。默认只试算。
 
     幂等且**双向**：方向从原始行重推，所以规则改回来时也能还原。
+
+    分类优先级：**人工指定 > 规则 > 原值**。
+    人工指定必须排第一 —— 否则用户刚手工纠正的分类，跑一次 recompute
+    就被规则改回去，等于这个功能没做。原值垫底是为了「规则认不出来的
+    交易不要被洗成未分类」。
     """
+    manual = manual_map(ledger)
+
     rows = ledger.conn.execute(
         "SELECT id, source, direction, category, counterparty, item, amount, raw FROM txn"
     ).fetchall()
 
     changes = []
     for r in rows:
-        new_cat = classify_by_rules(r["counterparty"], r["item"]) or r["category"]
+        merchant = normalize_text(r["counterparty"])
+        new_cat = category_for(merchant, r["counterparty"], r["item"], manual) or r["category"]
         new_dir = _derive_direction(r)
         # 非消费分类只压支出，收入保留（家里给的生活费要算收入）
         if new_cat in NON_CONSUMPTION_CATEGORIES and new_dir == DIRECTION_EXPENSE:
@@ -116,6 +130,8 @@ def recompute(ledger: Ledger, apply: bool = False,
     off_income = [c for c in changes if c["old_dir"] == "income" and c["new_dir"] != "income"]
     recategorised = [c for c in changes if c["old_cat"] != c["new_cat"]]
 
+    if manual:
+        emit(f"人工指定的商户 {len(manual)} 个（优先级高于规则，不会被规则改回）")
     emit(f"待修正 {len(changes)} 笔（全库 {len(rows)} 笔）")
     for label, group in (
         ("支出 → 不计消费", off_expense),
@@ -142,6 +158,79 @@ def recompute(ledger: Ledger, apply: bool = False,
 
     if not apply:
         emit("这是试算，**没有改动任何数据**。确认无误后加 --apply 执行。")
+        return {"changed": len(changes), "applied": False}
+
+    for c in changes:
+        ledger.conn.execute(
+            "UPDATE txn SET category = ?, direction = ? WHERE id = ?",
+            (c["new_cat"], c["new_dir"], c["id"]),
+        )
+    ledger.conn.commit()
+    emit(f"已修正 {len(changes)} 笔。")
+    return {"changed": len(changes), "applied": True}
+
+
+def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
+                 apply: bool = False, emit: Callable[[str], None] = print) -> dict:
+    """把「某一个商户」的人工分类应用到**已经入库**的历史交易。
+
+    set_manual() 写的是「商户 → 分类」缓存表，新导入的交易下次自动生效；
+    但躺在库里的历史交易不会自己变，靠这个函数补上。
+
+    范围刻意收窄到只有一个商户（对比 recompute 的全库重算）：
+    手工纠一个商户时不该动别的地方，影响面越窄越可预测 ——
+    真出问题时也能一眼知道是哪次操作干的。
+
+    category=None 表示「撤销人工指定」：该商户退回规则判定。
+    **规则仍然认不出就落到「未分类」，而不是保留现值。**
+    这里刻意和 recompute 不一样 —— 撤销是个明确的动作，用户要看到
+    分类真的变回去了；如果保留原来的手工值，命令报「已撤销」但界面上
+    分类纹丝不动，看起来就像撤销失败。
+
+    默认只试算，--apply 才写库；写库前由调用方负责备份密文。
+    """
+    key = normalize_text(merchant)
+    if not key:
+        raise ValueError("商户名不能为空")
+
+    manual = manual_map(ledger)
+    target = manual.get(key) if category is None else category
+
+    # 归一化比较只能放在 Python 里做：SQLite 没有 normalize_text，
+    # 而商户名可能有全角/多余空白这类差异。账本规模（几千笔以内）下这样最稳。
+    rows = [
+        r for r in ledger.conn.execute(
+            "SELECT id, source, direction, category, counterparty, item, amount, raw FROM txn"
+        ).fetchall()
+        if normalize_text(r["counterparty"]) == key
+    ]
+
+    changes = []
+    for r in rows:
+        if target is None:
+            new_cat = classify_by_rules(r["counterparty"], r["item"]) or DEFAULT_CATEGORY
+        else:
+            new_cat = target
+        new_dir = _derive_direction(r)
+        if new_cat in NON_CONSUMPTION_CATEGORIES and new_dir == DIRECTION_EXPENSE:
+            new_dir = DIRECTION_NEUTRAL
+        if new_cat != r["category"] or new_dir != r["direction"]:
+            changes.append({
+                "id": r["id"], "amount": r["amount"],
+                "old_cat": r["category"], "new_cat": new_cat,
+                "old_dir": r["direction"], "new_dir": new_dir,
+            })
+
+    emit(f"商户「{key}」历史交易 {len(rows)} 笔，需要改动 {len(changes)} 笔")
+    if changes:
+        flows = Counter((c["old_cat"], c["new_cat"]) for c in changes)
+        for (old, new), n in flows.most_common(10):
+            emit(f"    {old:<10} → {new:<10} {n:>3} 笔")
+
+    if not changes:
+        return {"changed": 0, "applied": False}
+    if not apply:
+        emit("这是试算，**没有改动已入库的历史交易**。确认无误后加 --apply 执行。")
         return {"changed": len(changes), "applied": False}
 
     for c in changes:
