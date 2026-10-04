@@ -22,7 +22,7 @@ import os
 import subprocess
 import sys
 
-from . import __version__, monthly, review_ui, secure_store
+from . import __version__, fixups, monthly, review_ui, secure_store
 from .model import SOURCE_LABELS
 from .pipeline import import_file
 from .render import money, print_month, print_overview
@@ -96,6 +96,26 @@ def cmd_monthly(args) -> int:
         keep=args.keep, dry_run=args.dry_run,
         auto_review=not args.no_review,
     )
+
+
+# --------------------------------------------------------------------------
+# recompute —— 按当前规则修正历史数据（默认只试算）
+# --------------------------------------------------------------------------
+
+def cmd_recompute(args) -> int:
+    vault = _vault(args)
+    enc = secure_store.encrypted_path(vault)
+
+    if args.apply:
+        if os.path.exists(enc):
+            fixups.backup(enc)
+        with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+            fixups.recompute(ledger, apply=True)
+    else:
+        # 试算：只读内存，退出时不写回
+        with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+            fixups.recompute(ledger, apply=False)
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -340,6 +360,13 @@ def build_parser() -> argparse.ArgumentParser:
     # ---- store ----
     p = _add_vault(sub.add_parser("store", help="查看账本存储状态与加密情况"))
     p.set_defaults(func=cmd_store)
+
+    # ---- recompute ----
+    p = _add_vault(sub.add_parser(
+        "recompute", help="按当前规则修正历史数据的分类与方向（默认只试算）"))
+    p.add_argument("--apply", action="store_true",
+                   help="真正写库（会先自动备份密文）。不加则只试算")
+    p.set_defaults(func=cmd_recompute)
 
     # ---- sources ----
     sub.add_parser("sources", help="各渠道怎么导出账单").set_defaults(func=cmd_sources)

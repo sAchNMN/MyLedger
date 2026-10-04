@@ -22,7 +22,7 @@ import urllib.request
 from datetime import datetime
 from typing import Iterable, Optional
 
-from .model import DIRECTION_EXPENSE, Txn, normalize_text
+from .model import DIRECTION_EXPENSE, DIRECTION_NEUTRAL, Txn, normalize_text
 from .power import require_ac
 
 # --------------------------------------------------------------------------
@@ -38,24 +38,28 @@ CATEGORIES = (
 
 DEFAULT_CATEGORY = "未分类"
 
-# 规则表：(分类, 关键词元组)
-# 关键词越具体越靠前。先匹配到的先赢。
-RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("提现充值", ("充值", "提现", "零钱通", "余额宝", "理财通", "转入", "转出")),
-    ("转账还款", ("还款", "花呗", "借呗", "信用卡", "备用金", "转账", "红包", "亲属卡")),
-    ("退款", ("退款", "退货", "赔付")),
+# 这几个分类按定义就不是「消费」：钱只是在自己的账户之间搬，或者是在还自己的账。
+#
+# 判定为这几个分类的交易，方向一律压成中性，不管平台在「收/支」列里写了什么。
+# 为什么必须这么做：实测微信把「零钱通转出」在收/支里标成**支出**——
+# 从那个钱包的角度钱确实出去了，但它不是消费。
+# 用户 9 月账单里这一类占了 16,617 元，是当月"总支出"的 61%，全是虚的。
+NON_CONSUMPTION_CATEGORIES = frozenset({"提现充值", "转账还款", "退款"})
 
+# 规则表：(分类, 关键词元组)
+#
+# 顺序有讲究：**先具体后笼统**。
+# 「提现充值」「转账还款」放在最后 —— 它们的关键词（充值 / 转账 / 转入 / 转出）
+# 太宽，放前面会把「话费充值」（真实消费，该进通讯网络）之类的东西吸走。
+# 这条顺序错误实测让用户的支出报表多算了一笔。
+RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("餐饮", ("餐饮", "外卖", "餐厅", "饭店", "小吃", "快餐", "烧烤", "火锅", "面馆",
               "米饭", "食堂", "咖啡", "奶茶", "茶饮", "星巴克", "瑞幸", "蜜雪",
               "肯德基", "麦当劳", "汉堡", "面包", "早餐", "便利店")),
-    ("交通", ("地铁", "公交", "出行", "打车", "滴滴", "出租车", "高铁", "火车", "机票",
-              "航空", "加油", "停车", "高速", "单车", "共享", "哈啰", "青桔", "车费")),
-    ("日用百货", ("超市", "百货", "生鲜", "菜市场", "蔬菜", "水果", "便利店", "永辉",
-                  "华润", "丹尼斯", "大润发", "杂货")),
-    ("生活缴费", ("水电", "电费", "水费", "燃气", "物业", "取暖", "暖气", "缴费",
-                  "国家电网", "供电", "自来水")),
     ("通讯网络", ("话费", "流量", "宽带", "移动", "联通", "电信", "中国移动",
                   "中国联通", "中国电信")),
+    ("生活缴费", ("水电", "电费", "水费", "燃气", "物业", "取暖", "暖气", "缴费",
+                  "国家电网", "供电", "自来水")),
     ("学习文具", ("书店", "图书", "文具", "教育", "培训", "网课", "慕课", "学习",
                   "当当", "考试", "报名费", "学费", "知网")),
     ("医疗健康", ("医院", "药房", "药店", "诊所", "医疗", "体检", "挂号", "医药",
@@ -72,8 +76,16 @@ RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("住房", ("房租", "租金", "中介", "公寓", "住宿", "酒店", "民宿")),
     ("旅行", ("旅游", "旅行", "景区", "携程", "去哪儿", "飞猪", "酒店预订")),
     ("人情往来", ("礼金", "随礼", "份子", "慰问", "捐赠")),
+    ("交通", ("地铁", "公交", "出行", "打车", "滴滴", "出租车", "高铁", "火车", "机票",
+              "航空", "加油", "停车", "高速", "单车", "共享", "哈啰", "青桔", "车费")),
+    ("日用百货", ("超市", "百货", "生鲜", "菜市场", "蔬菜", "水果", "便利店", "永辉",
+                  "华润", "丹尼斯", "大润发", "杂货")),
     ("购物", ("淘宝", "天猫", "拼多多", "唯品会", "商城", "服饰", "服装", "鞋",
               "优衣库", "商场", "购物")),
+    # ↓ 以下是「非消费」分类，必须放最后
+    ("退款", ("退款", "退货", "赔付")),
+    ("转账还款", ("还款", "花呗", "借呗", "信用卡", "备用金", "转账", "红包", "亲属卡")),
+    ("提现充值", ("充值", "提现", "零钱通", "余额宝", "理财通", "转入", "转出")),
 )
 
 
@@ -171,11 +183,25 @@ def ai_classify(merchants: list[str], url: str = DEFAULT_AI_URL,
 # 编排
 # --------------------------------------------------------------------------
 
+def _apply_non_consumption(txns) -> int:
+    """把落在「非消费」分类里的交易，方向压成中性。返回改动笔数。
+
+    必须在分类之后做 —— 方向是解析时定的，那时还不知道分类。
+    """
+    changed = 0
+    for txn in txns:
+        if txn.category in NON_CONSUMPTION_CATEGORIES and txn.direction != DIRECTION_NEUTRAL:
+            txn.direction = DIRECTION_NEUTRAL
+            changed += 1
+    return changed
+
+
 def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
                ai_url: str = DEFAULT_AI_URL, ai_model: str = DEFAULT_AI_MODEL,
                ignore_power: bool = False) -> dict:
     """给交易打分类标签。返回统计信息。"""
-    stats = {"rules": 0, "cache": 0, "ai": 0, "unmatched": 0, "ai_used": False}
+    stats = {"rules": 0, "cache": 0, "ai": 0, "unmatched": 0, "ai_used": False,
+             "neutralised": 0}
 
     # 先读缓存：同一个商户只判定一次
     cache: dict[str, str] = {
@@ -207,6 +233,7 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
             unmatched.add(merchant)
 
     if not use_ai or not unmatched:
+        stats["neutralised"] = _apply_non_consumption(txns)
         return stats
 
     if not require_ac(f"本地 AI 分类（{len(unmatched)} 个未识别商户）", override=ignore_power):
@@ -238,6 +265,7 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
             cache[merchant] = mapping[merchant]
 
     ledger.conn.commit()
+    stats["neutralised"] = _apply_non_consumption(txns)
     return stats
 
 
