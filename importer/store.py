@@ -410,15 +410,68 @@ class Ledger:
         return rows
 
     def resolve(self, txn_id: int, decision: str, note: str = "") -> bool:
-        """人工裁定。decision = confirmed_dup | confirmed_ok。"""
+        """直接把某笔的复核标记设成 decision，返回是否命中一行。
+
+        低层入口：不检查这条是不是「待复核」，也不看原来是什么状态。
+        给终端 `review --resolve <id>` 用 —— 那里是人明确点名要改哪一条，
+        而且终端会把目标记录完整打出来（金额、对方、当前状态）让人确认。
+
+        网页界面请走 resolve_review()：那边按 id 提交，会被重放、被手写、
+        被两个标签页同时发，必须有状态守卫。
+
+        note 为空时**保留**原有的 review_note：那是「为什么怀疑重复」的判定依据，
+        裁定之后依然有用，不该被顺手抹掉。
+        """
         if decision not in ("confirmed_dup", "confirmed_ok"):
             raise ValueError("decision 只能是 confirmed_dup 或 confirmed_ok")
-        cur = self.conn.execute(
-            "UPDATE txn SET review = ?, review_note = ? WHERE id = ?",
-            (decision, note, txn_id),
-        )
+        if note:
+            cur = self.conn.execute(
+                "UPDATE txn SET review = ?, review_note = ? WHERE id = ?",
+                (decision, note, txn_id),
+            )
+        else:
+            cur = self.conn.execute(
+                "UPDATE txn SET review = ? WHERE id = ?", (decision, txn_id))
         self.conn.commit()
         return cur.rowcount > 0
+
+    def resolve_review(self, txn_id: int, decision: str) -> str:
+        """网页复核界面的裁定入口，带状态守卫。返回一个状态码字符串：
+
+            updated          刚刚改掉
+            unchanged        已经是这个裁定（重复提交、双击、重放）
+            not_found        没有这个 id
+            not_reviewable   这条不是待复核记录
+            already_decided  已经人工定过案了，不允许被另一个决定覆盖
+
+        为什么界面这条必须守（ML-008）：
+            原来的实现是 `UPDATE txn SET review = ? WHERE id = ?`，
+            于「幂等重放」和「随便改一条正常记录」在代码里长得一模一样 ——
+            而后果天差地别：把一笔正常消费标成 confirmed_dup，
+            它会从所有报表里消失，而且没有任何痕迹。
+
+            前端的按钮是盲发的：它只知道「我发了这个 id」。
+            所以「这个 id 该不该改」只能由后端判断。
+        """
+        if decision not in ("confirmed_dup", "confirmed_ok"):
+            raise ValueError("decision 只能是 confirmed_dup 或 confirmed_ok")
+
+        row = self.conn.execute(
+            "SELECT review FROM txn WHERE id = ?", (txn_id,)).fetchone()
+        if row is None:
+            return "not_found"
+
+        current = row["review"] or ""
+        if current == decision:
+            return "unchanged"
+        if current in ("confirmed_dup", "confirmed_ok"):
+            return "already_decided"
+        if not current.startswith("suspect"):
+            return "not_reviewable"
+
+        self.conn.execute("UPDATE txn SET review = ? WHERE id = ?", (decision, txn_id))
+        self.conn.commit()
+        return "updated"
 
     # ------------------------------------------------------------------
     # 报表

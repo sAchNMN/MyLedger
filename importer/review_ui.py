@@ -298,12 +298,43 @@ def build_server(ledger: Ledger, *, port: int = 0, host: str = "127.0.0.1",
             # （见 secure_store._memory_conn）。理论上一次只点一个按钮不会撞，
             # 但浏览器可能重发请求、或者你手快点了两下——不加锁迟早撞上。
             with lock:
-                ledger.resolve(txn_id, decision)
-                state["resolved"] += 1
-                done = state["resolved"] >= state["total"]
+                result = ledger.resolve_review(txn_id, decision)
+                if result == "updated":
+                    state["resolved"] += 1
+                # 关界面的判据是「库里还剩几笔待确认」，不是「收到过几次提交」。
+                #
+                # 用提交次数当判据会出两种错：双击一次就把界面提前关掉
+                # （同一个决定被数了两遍），以及列表里有重复项时永远关不掉。
+                # 直接问库要真话最省心。
+                remaining = ledger.conn.execute(
+                    "SELECT COUNT(*) AS n FROM txn WHERE review LIKE 'suspect%'"
+                ).fetchone()["n"]
+                done = remaining == 0
+
+            # 每一种结局都给出不同的 HTTP 状态码。
+            #
+            # 为什么不能都回 200：fetch() 不会因为 4xx/5xx 抛异常，
+            # 前端只能靠 response.ok 判断成败。全都回 200 的话，
+            # 「改好了」「id 不存在」「这条不该由你改」在页面上长得一模一样，
+            # 用户看到跳到了下一条，就以为这一笔已经记下了。
+            if result == "not_found":
+                self._reply({"ok": False, "error": "not_found", "id": txn_id}, 404)
+                return
+            if result == "not_reviewable":
+                self._reply({"ok": False, "error": "not_reviewable", "id": txn_id}, 409)
+                return
+            if result == "already_decided":
+                self._reply({"ok": False, "error": "already_decided", "id": txn_id}, 409)
+                return
+
+            body = {"ok": True, "id": txn_id, "updated": result == "updated"}
             if done:
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
-            self._send(200, b'{"ok":true}', "application/json; charset=utf-8")
+            self._reply(body, 200)
+
+        def _reply(self, payload: dict, code: int) -> None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._send(code, body, "application/json; charset=utf-8")
 
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.timeout = timeout_seconds
