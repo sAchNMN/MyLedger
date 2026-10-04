@@ -43,6 +43,18 @@ from .store import Ledger
 ENCRYPTED_NAME = "ledger.db.enc"
 PLAINTEXT_NAME = "ledger.db"
 
+# 一个 MyLedger 账本必须有的表。迁移前先核对，见 _require_ledger_schema。
+REQUIRED_TABLES = ("txn", "batch")
+
+
+class MigrationError(RuntimeError):
+    """明文库迁移没做成。
+
+    抛出这个异常之前，本次运行写出去的密文一定已经被撤掉了：
+    半成品密文比没有密文更危险 —— 下次 open_ledger 会优先读它，
+    然后告诉你「账本解不开」，而真正的数据其实还躺在明文里。
+    """
+
 
 def encrypted_path(vault_dir: str) -> str:
     return os.path.join(vault_dir, ENCRYPTED_NAME)
@@ -50,6 +62,95 @@ def encrypted_path(vault_dir: str) -> str:
 
 def plaintext_path(vault_dir: str) -> str:
     return os.path.join(vault_dir, PLAINTEXT_NAME)
+
+
+def plaintext_artifacts(vault_dir: str) -> list[str]:
+    """vault 里还留着的明文副本：主文件 + 附属文件。
+
+    -wal / -shm 必须一起看。只盯主文件的话，最近一次还没 checkpoint 的改动
+    仍然留在 -wal 里 —— 那份东西一样能被读出来，而且更像「没人注意的角落」。
+    """
+    plain = plaintext_path(vault_dir)
+    return [p for p in (plain, f"{plain}-wal", f"{plain}-shm") if os.path.exists(p)]
+
+
+def ledger_fingerprint(conn) -> dict:
+    """一份能代表「这是同一本账」的摘要。
+
+    迁移前算一次，把密文重新打开后再算一次，两边相等才算迁移成功。
+
+    只用与扫描顺序无关的聚合值：表清单 + 笔数 + 金额合计 + 时间范围 + 最大 id。
+    金额合计走 printf('%.2f', ...)：钱只到分，舍到两位小数之后，
+    浮点求和的最后一位差异就不会造成假报警。
+    """
+    tables = sorted(row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"))
+    # 一律按位置取值：源库是裸 sqlite3.connect()（行是元组），
+    # 内存库的 row_factory 是 sqlite3.Row。用列名的话总有一边会炸。
+    row = conn.execute(
+        "SELECT COUNT(*) AS n,"
+        " COALESCE(printf('%.2f', SUM(CAST(amount AS REAL))), '0.00') AS total,"
+        " COALESCE(MIN(ts), '') AS first_ts,"
+        " COALESCE(MAX(ts), '') AS last_ts,"
+        " COALESCE(MAX(id), 0) AS max_id FROM txn").fetchone()
+    batches = conn.execute("SELECT COUNT(*) FROM batch").fetchone()[0]
+    return {
+        "tables": tables,
+        "txn": row[0],
+        "total": row[1],
+        "first_ts": row[2],
+        "last_ts": row[3],
+        "max_id": row[4],
+        "batches": batches,
+    }
+
+
+def _require_ledger_schema(conn, path: str) -> None:
+    """确认这个 sqlite 文件确实是 MyLedger 的账本。
+
+    不核对就直接迁移的话，vault 里随便一个同名的 sqlite 文件都会被
+    「加密归档」，而真正的账本可能还在别处 —— 密文看起来是成功了，
+    打开却是空的。宁可在这里拒绝。
+    """
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    missing = [name for name in REQUIRED_TABLES if name not in tables]
+    if missing:
+        raise MigrationError(
+            f"{path} 里缺少账本该有的表：{'、'.join(missing)}。\n"
+            f"  这看起来不是一个 MyLedger 账本，迁移已中止，没有写任何东西。\n"
+            f"  如果它确实是你的账本（比如更早的版本），先把它挪到别处再手动处理。"
+        )
+
+
+def _verify_encrypted_copy(enc_path: str) -> dict:
+    """把刚写出来的密文当成一个陌生文件重新打开，返回它的指纹。
+
+    不重开一遍就不算验证过：protect() 返回只说明字节写出去了，
+    不代表这些字节能变回一个能用的数据库。
+    """
+    with open(enc_path, "rb") as fh:
+        blob = fh.read()
+    conn = _memory_conn()
+    try:
+        conn.deserialize(credentials.unprotect(blob))
+        _require_ledger_schema(conn, enc_path)
+        return ledger_fingerprint(conn)
+    finally:
+        conn.close()
+
+
+def _discard_failed_migration(enc_path: str, warn: Callable[[str], None]) -> None:
+    """删掉本次刚写出来的密文。
+
+    只在迁移分支里调用 —— 进入那个分支的前提正是「密文本来不存在」，
+    所以删掉它等于把状态恢复成动手之前的样子。
+    """
+    try:
+        os.remove(enc_path)
+    except OSError as exc:
+        warn(f"！删除校验失败的密文时出错：{exc}")
+        warn(f"  请手动删掉 {enc_path}，否则下次启动会去解一份坏掉的密文。")
 
 
 def _atomic_write(path: str, data: bytes) -> None:
@@ -132,7 +233,7 @@ def open_ledger(vault_dir: str, *, warn: Callable[[str], None] = print) -> Ledge
     plain = plaintext_path(vault_dir)
     if os.path.exists(plain):
         warn(f"发现明文库：{plain}")
-        warn("  正在迁移到加密存储（明文文件不会被自动删除，请你手动处理它）。")
+        warn("  正在迁移到加密存储……")
         src = sqlite3.connect(plain)
         try:
             # 关键一步：先把 WAL 落回主库。
@@ -147,15 +248,53 @@ def open_ledger(vault_dir: str, *, warn: Callable[[str], None] = print) -> Ledge
             # 顺带一提：这条 PRAGMA 也会把 -wal 里的未提交内容并回主库，
             # 不加的话迁移会丢掉最近一次未 checkpoint 的数据。
             src.execute("PRAGMA journal_mode = DELETE")
+            _require_ledger_schema(src, plain)
+            before = ledger_fingerprint(src)
             raw = src.serialize()
         finally:
             src.close()
+
         _atomic_write(enc, credentials.protect(raw))
+
+        # ------------------------------------------------------------------
+        # 写完不等于写对。
+        #
+        # 这一段是 ML-009 的核心。原来的流程到上一行就结束了，然后打印一句
+        # 「明文文件不会被自动删除，请你手动处理它」—— 也就是说，在没有任何
+        # 证据的情况下就宣布「迁移完成」。加解密、序列化、原子替换，任何一步
+        # 出错都可能留下一份打不开或缺表的密文，而明文还躺在旁边，
+        # 一切看起来正常。等你手滑把明文删了，才会发现备份是空的。
+        #
+        # 所以现在：把密文当陌生文件重开一遍，逐项核对。
+        # 核对不过就撤销 —— 删掉这份密文、原样保留明文、抛错。
+        # 半成品密文比没有密文更危险：下次启动会优先读它，然后说「账本解不开」。
+        # ------------------------------------------------------------------
+        try:
+            after = _verify_encrypted_copy(enc)
+        except Exception as exc:
+            _discard_failed_migration(enc, warn)
+            raise MigrationError(
+                f"迁移校验没过：刚写出的 {enc} 打不开或不像账本"
+                f"（{type(exc).__name__}: {exc}）。\n"
+                f"  已经撤销本次迁移（删掉了那份密文），明文库原样保留：{plain}\n"
+                f"  你的数据没有丢，也没有被动过，可以放心重试。"
+            ) from exc
+
+        if after != before:
+            _discard_failed_migration(enc, warn)
+            diff = "、".join(k for k in before if before.get(k) != after.get(k))
+            raise MigrationError(
+                f"迁移校验没过：密文里的内容和源库对不上（不一致的项：{diff}）。\n"
+                f"  已经撤销本次迁移，明文库原样保留：{plain}\n"
+                f"  这种情况下**不要**删明文，先把情况查清楚。"
+            )
+
         conn = _memory_conn()
         conn.deserialize(raw)
         ledger = Ledger(conn, enc, init_schema=False)
         warn(f"  已迁移到 {enc}")
-        warn(f"  ！请手动删除明文库 {plain}（以及同目录的 -wal / -shm 文件）")
+        warn(f"  校验通过：{before['txn']} 笔，合计 {before['total']} 元，"
+             f"时间范围 {before['first_ts']} ~ {before['last_ts']}")
         return ledger
 
     # 全新账本
@@ -190,6 +329,7 @@ def status(vault_dir: str) -> dict:
     """给 CLI 看的存储状态。"""
     enc = encrypted_path(vault_dir)
     plain = plaintext_path(vault_dir)
+    artifacts = plaintext_artifacts(vault_dir)
     info = {
         "vault": vault_dir,
         "encrypted_path": enc,
@@ -197,9 +337,7 @@ def status(vault_dir: str) -> dict:
         "encrypted_size": os.path.getsize(enc) if os.path.exists(enc) else 0,
         "plaintext_exists": os.path.exists(plain),
         "plaintext_path": plain,
-        "wal_files": [
-            f"{plain}{suffix}" for suffix in ("-wal", "-shm")
-            if os.path.exists(f"{plain}{suffix}")
-        ],
+        "plaintext_artifacts": artifacts,
+        "wal_files": [p for p in artifacts if p != plain],
     }
     return info
