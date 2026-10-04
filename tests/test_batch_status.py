@@ -202,6 +202,21 @@ def main() -> int:
 
     print()
     print("=" * 78)
+    print("batch_id 唯一性：同一秒内重跑同一个文件不能撞主键")
+    print("=" * 78)
+    # batch_id 原来是「秒级时间戳 + 文件 sha 前 6 位」。
+    # 部分失败之后马上重跑，或者自动化在同一秒里跑两次同一个文件，
+    # 两次算出来的 id 一模一样 → INSERT 撞 batch 的主键 →
+    # 整个导入在 start_batch 就崩掉，源文件永远处理不了。
+    led = Ledger(sqlite3.connect(":memory:"), ":memory:")
+    ids = [led.start_batch("alipay", "同一个合成文件.csv", parsed=3) for _ in range(3)]
+    check("三次拿到的 id 互不相同", len(set(ids)), 3)
+    check("库里三次批次都在",
+          led.conn.execute("SELECT COUNT(*) FROM batch").fetchone()[0], 3)
+    check("id 仍然可读（带序号后缀）", ids[1].startswith(ids[0]), True)
+
+    print()
+    print("=" * 78)
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：")
         for item in FAILURES:

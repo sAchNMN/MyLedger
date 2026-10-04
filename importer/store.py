@@ -263,7 +263,20 @@ class Ledger:
                       f"（批次 {prev['batch_id']}，写入 {prev['inserted']} 笔），"
                       f"本次重复的流水会被自动跳过。")
 
-        self.batch_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + (sha[:6] or "nohash")
+        # batch_id = 秒级时间戳 + 文件 sha 前 6 位。
+        #
+        # 为什么还要加序号后缀：部分失败之后马上重跑（或者自动化在同一秒里
+        # 跑两次同一个文件）算出来的 id 完全一样，INSERT 直接撞 batch 的主键，
+        # 整个导入在 start_batch 就崩掉 —— 源文件永远处理不了。
+        # 这条是修 ML-006 时被测试抓出来的：状态机允许重试，id 却不允许。
+        # 后缀用可读的 .2 / .3 而不是随机串：出问题时一眼能看出是同一秒的第二次。
+        base = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + (sha[:6] or "nohash")
+        self.batch_id = base
+        suffix = 1
+        while self.conn.execute(
+                "SELECT 1 FROM batch WHERE batch_id = ?", (self.batch_id,)).fetchone():
+            suffix += 1
+            self.batch_id = f"{base}.{suffix}"
         self._batch_seen_keys.clear()
         self._batch_seen_fp.clear()
         self.conn.execute(
