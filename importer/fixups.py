@@ -50,8 +50,19 @@ def _derive_direction(row) -> str:
     只能靠备份回滚。太脆。
 
     原始行里存着平台自己的「收/支」列，用它重算即可。
-    没有方向列的来源（银行 PDF / 截图，方向是按金额正负号定的）
-    保持原样，不猜 —— 猜错比不改更糟。
+    没有方向列的来源（银行 PDF / 截图，方向是按金额正负号定的）保持原样。
+
+    raw 存在三种形态，每一种都要处理对：
+
+        1. 新格式：显式记着「方向列」的值。
+           空值也是答案 —— 微信的中性交易那一格就是空的。
+        2. 老格式：raw["原始"] 是整行，方向列按下标取；列数变了就退回按值搜。
+        3. 更早的：raw 是 {}（schema 的默认值就是 '{}'）。
+
+    第 3 种是修 ML-010 时顺手发现的坑：原来的代码在「查不到方向值」时
+    继续往下走，而 parse_direction("") 返回的是**中性** ——
+    跑一次 recompute --apply，一批支出就会从报表里消失，全程没有任何报错。
+    查不到就别猜：不改，永远比改错安全。
     """
     if row["source"] in _SIGN_DERIVED_SOURCES:
         return row["direction"]
@@ -66,22 +77,23 @@ def _derive_direction(row) -> str:
         cell = raw.get("方向列") or ""
         return parse_direction(cell, row["counterparty"], row["item"])
 
-    # 2) 老数据：按来源的已知列下标取。
-    #    列超出范围（格式变了）才退回按值搜。
     cells = raw.get("原始", [])
     idx = _DIRECTION_INDEX_HINT.get(row["source"])
-    if idx is not None and idx < len(cells):
-        cell = cells[idx]          # 可能为空 —— 微信的中性交易就是空值
-    else:
-        cell = ""
-        for c in cells:
-            if normalize_text(c) in _DIRECTION_LABELS:
-                cell = c
-                break
 
-    if not cell and idx is None:
-        return row["direction"]
-    return parse_direction(cell, row["counterparty"], row["item"])
+    # 2) 老数据：按来源的已知列下标取。可能为空 —— 微信的中性交易就是空值，
+    #    空值在这里是答案，不是「查不到」。
+    if idx is not None and idx < len(cells):
+        return parse_direction(cells[idx], row["counterparty"], row["item"])
+
+    # 3) 下标不可用（格式改了、列数变了）→ 退回按值搜。
+    #    按值搜会把备注里恰好写着「收入」的格子当成方向列，所以只在
+    #    拿不到下标时才用它，而且要求整格相等（实测过这个坑，见文件头注释）。
+    for cell in cells:
+        if normalize_text(cell) in _DIRECTION_LABELS:
+            return parse_direction(cell, row["counterparty"], row["item"])
+
+    # 4) 什么线索都没有：保持原样。
+    return row["direction"]
 
 
 def recompute(ledger: Ledger, apply: bool = False,
