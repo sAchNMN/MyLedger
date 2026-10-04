@@ -94,3 +94,8 @@ target/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- 9. AI 助手的工作数据 ---
+# .workbuddy/ 存本项目的会话记忆（memory/*.md）与工具状态，属于本地工作状态，不进仓库。
+# 注意：不要删这个目录，它不是缓存。
+.workbuddy/
