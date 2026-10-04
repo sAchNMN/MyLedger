@@ -47,7 +47,11 @@
 | 账本加密存储（明文不落盘） | ✅ 可用 |
 | 月度批处理 + 自动触发 | ✅ 可用 |
 | 历史数据按新规则修正 | ✅ `recompute`，默认只试算 |
+| 历史 raw 里的整行原文清理 | ✅ `recompute --strip-raw`，默认只试算 |
 | 报告（月度支出构成 / 收入） | ✅ 可用 |
+| 任何写入失败都不会被当成成功 | ✅ 批次状态机，见 §5.9 |
+| 后台日志最小化（不含交易内容） | ✅ 结构化白名单日志，见 §5.10 |
+| 明文库迁移的校验与隔离 | ✅ 校验不过就撤销，明文进隔离目录，见 §5.11 |
 
 ---
 
@@ -203,6 +207,52 @@ PDF 解密必须有库，绕不过去。引入 **PyMuPDF**（装在隔离 venv �
 `scripts\monthly.cmd` 与后台执行器会**优先使用该 venv 的解释器**，
 否则 PDF 导入会报「没有 PDF 库」。
 
+### 5.9 成功 ≠ 程序没抛异常：批次有明确状态
+
+导入是逐笔写入、单行失败不拖垮整份账单。所以「循环跑完」和「全部写入成功」
+是两件事 —— 一个 `ok: bool` 表达不了「98 成 2 败」。
+
+```
+started ──→ writing ──→ committed ──→ archived
+              │
+              └──→ partial_failed ──→ writing（补完重试）
+              └──→ failed
+```
+
+硬约束只有一条但最关键：**`archived` 只能从 `committed` 来**。
+部分失败的批次绝不允许归档 —— 源文件一旦被移进 `_done/`，
+失败的那几笔就再也不会被重试，报表上永远少这几笔，且全程没有报错。
+
+`ImportOutcome.ok` 现在是由 `status` 派生的属性，不再是独立字段：
+两个来源迟早会不一致，而不一致的方向如果恰好是「状态说失败、ok 说成功」，就又漏记了。
+
+### 5.10 后台日志是白名单，不是「程序输出的副本」
+
+`monthly-run.ps1` 不再捕获子进程输出（`& $python ...` 不赋值，让报告留在屏幕上），
+日志改由 Python 自己写：`--log-file` + `importer/audit_log.py`，
+一行一条 JSON，只有白名单字段（计数、状态、错误码），文件名过脱敏。
+
+理由很直接：日志不像账本那样加密，却往往是 vault 里唯一一份人人可读的
+明文副本，还会被云盘同步和备份。而「把标准输出抄进文件」等于
+把解析失败的行、dry-run 预览、异常堆栈一并长期保留。
+
+配套：解析失败记录只留 行号 + 字段 + 错误码，绝不留原始单元格值（见 `sources.py` 头部）。
+
+### 5.11 明文库迁移：先校验，再隔离，之后每次提醒
+
+发现 `ledger.db` 时自动迁移，但**不是**「加密写出去就算完」：
+
+```
+核对源文件确实是账本（有 txn / batch 表），否则拒绝，一个字都不写
+  → 迁移前算指纹（表清单 + 笔数 + 金额合计 + 时间范围 + 最大 id）
+  → 写完密文当陌生文件重开一遍，再算一次指纹
+  → 对不上：删掉这份密文、明文原样保留、报错（不留半成品备份）
+  → 对上了：明文三件套（含 -wal / -shm）移入 vault\_plaintext_quarantine\
+```
+
+之后**每次**打开都会检查明文残留并强提醒 —— 安全提示只提醒一次等于没提醒。
+隔离是移动不是删除：校验逻辑本身也可能有 bug，删掉的责任留给用户确认后自己承担。
+
 ---
 
 ## 6. 踩过的坑（本节是本文档最有价值的部分）
@@ -328,6 +378,52 @@ SQLite 去找不存在的 `-wal` 文件，**每个查询都报 `unable to open d
 
 同理「缴费」会抢走「学费」。**先具体后笼统**。
 
+### 6.15 `batch_id` 用秒级时间戳会撞主键
+
+`batch_id = 秒级时间戳 + 文件 sha 前 6 位`。部分失败之后**马上重跑**，
+或者自动化在同一秒里跑两次同一个文件，两次算出来的 id 一模一样，
+`INSERT` 撞 `batch` 的主键 —— 整个导入在 `start_batch` 就崩掉，
+源文件永远处理不了。
+
+这个坑是在修 ML-006（部分失败不得归档）时被测试抓出来的：
+状态机允许重试，id 却不允许。**改「允许重试」时必须回头看 id 生成。**
+修法：撞车时加可读的序号后缀（`.2` / `.3`）。
+
+### 6.16 `fetch` 不会因为 4xx / 5xx 抛异常
+
+复核界面原来的写法：
+
+```javascript
+try { await fetch(...); } catch (e) {}
+idx++;          // 无论成没成都前进
+```
+
+`fetch` 只在**网络层**失败时 reject；HTTP 400/403/404/409/500 都会正常
+resolve。所以那个 `catch` 基本不会进，而 `idx++` 在 `try` 外面 ——
+请求失败了页面照样跳到下一条，用户以为记下了，裁定静默丢失。
+
+**判断成败必须看 `response.ok`**，而且 `idx++` 只能放在确认成功之后。
+
+### 6.17 「查不到」不能当成「查到了空值」
+
+`recompute` 靠 raw 重推收支方向。raw 是 `{}` 的老记录（schema 默认值）
+查不到方向值，而原来的代码继续往下走，`parse_direction("")` 返回**中性** ——
+跑一次 `recompute --apply`，一批支出就从报表里消失了，全程没有报错。
+
+「空值」和「没有这个字段」是两件事：
+微信的中性交易那一格**真的是空的**，那是答案；
+查不到字段则是「不知道」，此时**保持原样**才是安全的方向。
+
+### 6.18 提交闸门会把合成测试数据判成真实卡号
+
+闸门扫到测试里编的 16 位假卡号会直接拦截提交（拦截得对，但它不知道
+那是假数据）。**别用 16–19 位连续数字当测试数据** —— 换成 10 位左右，
+既能验脱敏逻辑，又不会撞银行卡号规则。
+
+另外：`git commit -m` 的消息里带 `\"` 时，PowerShell 双引号字符串会把
+它当成字符串结束符，提交信息被截断成多个参数（报 `fatal: Invalid path`）。
+**带引号的提交信息统一写进文件再用 `-F`。**
+
 ---
 
 ## 7. 怎么证明它是对的（验证方法）
@@ -338,9 +434,34 @@ SQLite 去找不存在的 `-wal` 文件，**每个查询都报 `unable to open d
 2. **验证用聚合输出，不用原始内容。** 例如「遮蔽骨架」：数字→9、中文→字、
    标点保留。既能看清结构，又不暴露任何真实值。
    `scripts\bank-pdf-probe.py` 就是这个思路的成品，输出可以安全外发。
-3. **每个分支都要有专门构造的数据走过。** 现有：
-   `tests/test_dedup.py`（三层去重）、`tests/make_fixtures.py`、
-   `tests/make_bank_pdf.py`（合成**加密** PDF，让 PDF 链路能在不碰真实数据的前提下验通）。
+3. **每个分支都要有专门构造的数据走过。** 合成数据生成器：
+   `tests/make_fixtures.py`、`tests/make_bank_pdf.py`（合成**加密** PDF）。
+   回归测试（每个都是独立脚本，退出码 0 表示通过）：
+
+   | 文件 | 钉住的东西 |
+   |---|---|
+   | `tests/test_dedup.py` | 三层去重（L3 曾长期损坏） |
+   | `tests/test_batch_status.py` | 批次状态机与 `batch_id` 唯一性 |
+   | `tests/test_import_state.py` | 导入的五种结局与归档条件 |
+   | `tests/test_monthly_archive.py` | 「源文件移动 ⟺ 本批全部成功」（真实 SQLite 触发器注入失败） |
+   | `tests/test_cli_import.py` | `import` 的部分失败报告与退出码 |
+   | `tests/test_parse_issues.py` | 解析失败记录不含原始值；打印文本无标记串 |
+   | `tests/test_audit_log.py` | 审计日志白名单；文件名脱敏 |
+   | `tests/test_background_log.py` | 真跑 `monthly-run.ps1`，按字节扫日志；`*.ps1` 的 BOM 守卫 |
+   | `tests/test_review_api.py` | 复核接口契约（403/400/404/409/幂等/翻案） |
+   | `tests/test_review_ui_js.py` | 复核页面在 Node 里真跑：失败不前进（需 Node，缺了会打印 SKIP） |
+   | `tests/test_store_migration.py` | 明文迁移的校验、撤销与隔离 |
+   | `tests/test_raw_minimization.py` | `raw` 不含报表用不到的列 |
+   | `tests/test_legacy_raw_compat.py` | 老库四种 raw 形态都能重推方向 |
+   | `tests/test_raw_cleanup.py` | 历史整行原文的清理（试算不动数据） |
+
+   一次跑完（PowerShell）：
+
+   ```powershell
+   $py = "$env:USERPROFILE\.workbuddy\binaries\python\envs\default\Scripts\python.exe"
+   $env:PYTHONUTF8='1'; $env:PYTHONIOENCODING='utf-8'
+   Get-ChildItem tests\test_*.py | ForEach-Object { & $py $_.FullName; "$($_.Name) exit=$LASTEXITCODE" }
+   ```
 
 ---
 
@@ -362,10 +483,14 @@ python -m importer ocr <图片...>            # 银行截图 → TSV（本地 OC
 python -m importer recompute
 python -m importer recompute --apply
 
+# 顺带清掉历史 raw 里的整行原文（同样默认只试算）
+python -m importer recompute --strip-raw
+python -m importer recompute --strip-raw --apply
+
 # 结构探针（换银行时先跑，输出全脱敏）
 <venv>\Scripts\python.exe scripts\bank-pdf-probe.py "账单.pdf"
 
-# 测试
+# 测试（全部独立脚本，退出码 0 = 通过）
 <venv>\Scripts\python.exe tests\test_dedup.py
 ```
 
@@ -394,6 +519,23 @@ python -m importer recompute --apply
 6. 跨年截图的年份处理（银行截图没有年份时会猜，已提示但不够稳）
 7. 数据库级的更强加密（SQLCipher），等数据模型稳定后再说
 8. 报表可视化（现在是终端表格）
+
+### 只读审计留下的项（5 个 P1 已修完，余下待办）
+
+审计报告见 `docs/P1-FIX-PLAN.md`（含每个小块的做法与验证方式）。
+5 个 P1 已全部修完并各有回归测试，**余下的是 P2 / P3**：
+
+| 编号 | 级别 | 事项 |
+|---|---|---|
+| ML-001 | P2 | 缺标准依赖清单与锁定（`pyproject.toml` / 锁文件） |
+| ML-003 | P2 | 提交闸门可被 `MYLEDGER_ALLOW_SENSITIVE` 显式绕过，且不记审计（见 §6.18 的误报也是同一条） |
+| ML-005 | P2 | 本地 AI 请求里带完整商户名（本机服务也会记日志） |
+| ML-011 | P2 | OCR 明文产物（`.raw.txt` / `.rows.tsv` / `.ocr.log`）没有保留期限 |
+| ML-012 | P2 | 7-Zip 密码进命令行参数（DATA-SAFETY.md 里已记为「已知残留风险」） |
+| ML-013 | P3 | 银行多金额行 / 无方向时的业务误判边界 |
+
+另：这次改的是**新数据**的写入路径；已经有真实数据的 vault 建议跑一次
+`recompute --strip-raw`（先不带 `--apply` 看清单）把历史整行原文清掉。
 
 ---
 
