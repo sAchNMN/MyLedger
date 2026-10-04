@@ -10,6 +10,9 @@ review 字段记录每笔交易的审核状态：
     suspect_near   疑似重复（金额+时间+对方相似）
     confirmed_dup  人工确认为重复
     confirmed_ok   人工确认为独立交易（不再提示）
+
+batch.status 记录一次导入走到哪一步了（见文件末尾的「批次状态」一节）。
+刻意不用一个 ok 布尔：导入是逐笔写入的，循环跑完 ≠ 写完了。
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ CREATE TABLE IF NOT EXISTS batch (
     identical    INTEGER DEFAULT 0,
     suspect      INTEGER DEFAULT 0,
     skipped      INTEGER DEFAULT 0,
+    status       TEXT NOT NULL DEFAULT 'started',
     note         TEXT DEFAULT ''
 );
 
@@ -95,6 +99,67 @@ def file_sha1(path: str) -> str:
     return digest.hexdigest()
 
 
+# --------------------------------------------------------------------------
+# 批次状态
+#
+# 为什么批次要有状态，而不是一个 ok 布尔（ML-006）：
+#
+#     导入是逐笔写入的，单行失败会记下来继续跑 —— 循环跑完不代表写完了。
+#     一旦把「程序没崩」当成「业务成功」，源文件就会被移进 _done/，
+#     失败的那几笔从此不再重试：报表上永远少这几笔，而且全程没有任何报错。
+#     这种事比直接崩掉危险得多，因为没人会去查。
+#
+#     ok: bool 只有一个 bit，表达不了「98 成 2 败」。所以这里给出显式状态，
+#     并把最关键的规则做成硬约束：**archived 只能从 committed 来**。
+#
+#     started ──→ writing ──→ committed ──→ archived
+#                   │
+#                   └──→ partial_failed ──→ writing（补完失败行后重试）
+#                   └──→ failed
+#
+#     `writing` 是可选中间态（小文件可以 started → committed 一次写完），
+#     但 partial_failed / failed / started 都不能直接跳到 archived。
+#
+#     老库（没有 status 列）在打开时自动补列，历史批次一律视为 started。
+# --------------------------------------------------------------------------
+
+BATCH_STATUSES = (
+    "started",          # 批次行刚建好，还没开始写交易
+    "writing",          # 正在逐笔写入
+    "partial_failed",   # 有行写失败，批次不完整，源文件必须留在原地
+    "committed",        # 全部写成功，可以归档
+    "failed",           # 整批失败（解析中断、写库异常）
+    "archived",         # 源文件已归档，终态
+)
+
+_BATCH_TRANSITIONS = {
+    "started": ("writing", "partial_failed", "committed", "failed"),
+    "writing": ("committed", "partial_failed", "failed"),
+    "partial_failed": ("writing", "committed", "failed"),
+    "committed": ("archived",),
+    "failed": ("writing",),
+    "archived": (),
+}
+
+
+def _ensure_batch_status_column(conn: sqlite3.Connection) -> bool:
+    """给老库补 status 列。补了就返回 True。
+
+    只有 ALTER 一条路：加密账本是用 init_schema=False 打开的
+    （schema 早就在密文里了），只在建新库时补列的话，
+    现有用户的库永远补不上，ML-006 的约束对他们等于没有。
+
+    老批次一律算 started：它们是在这个列存在之前写的，
+    当时没有「部分失败」这个概念，不能凭空给它们扣一个 partial_failed。
+    """
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(batch)")]
+    if not columns or "status" in columns:
+        return False
+    conn.execute("ALTER TABLE batch ADD COLUMN status TEXT NOT NULL DEFAULT 'started'")
+    conn.commit()
+    return True
+
+
 class Ledger:
     """账本。所有写操作都经过去重判定。
 
@@ -112,6 +177,9 @@ class Ledger:
         if init_schema:
             self.conn.executescript(SCHEMA)
             self.conn.commit()
+        # 补列放在 init_schema 分支外面：init_schema=False 的那条路
+        # （加密账本、明文迁移）才是现有用户真正走的路径，见函数注释。
+        _ensure_batch_status_column(self.conn)
         self._batch_seen_keys: set[str] = set()
         self._batch_seen_fp: dict[str, str] = {}
         self.batch_id = ""
@@ -200,12 +268,51 @@ class Ledger:
         self._batch_seen_fp.clear()
         self.conn.execute(
             "INSERT INTO batch (batch_id, source, path, origin, file_sha1, file_size,"
-            " imported_at, parsed, declared) VALUES (?,?,?,?,?,?,?,?,?)",
+            " imported_at, parsed, declared, status) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (self.batch_id, source, path, origin, sha, size,
-             datetime.now().isoformat(sep=" ", timespec="seconds"), parsed, declared),
+             datetime.now().isoformat(sep=" ", timespec="seconds"), parsed, declared,
+             "started"),
         )
         self.conn.commit()
         return self.batch_id
+
+    # ------------------------------------------------------------------
+    # 批次状态流转
+    # ------------------------------------------------------------------
+
+    def batch_status(self) -> str:
+        """当前批次的 status。没有打开的批次就报错，不返回空字符串。"""
+        if not self.batch_id:
+            raise ValueError("还没有打开的批次（先调 start_batch）")
+        row = self.conn.execute(
+            "SELECT status FROM batch WHERE batch_id = ?", (self.batch_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"批次 {self.batch_id} 不在库里")
+        return row["status"]
+
+    def set_batch_status(self, status: str) -> str:
+        """推进批次状态。非法流转抛 ValueError，且不改库。
+
+        刻意做成「拒绝」而不是「纠正」：状态机是防漏记的最后一道闸，
+        悄悄把 partial_failed 写成 committed 正是要防的事。
+        重复设置同一个状态是空操作（重试路径会走到）。
+        """
+        if status not in BATCH_STATUSES:
+            raise ValueError(
+                f"不是合法的批次状态：{status!r}（可选：{'、'.join(BATCH_STATUSES)}）")
+        current = self.batch_status()
+        if status == current:
+            return current
+        allowed = _BATCH_TRANSITIONS.get(current, ())
+        if status not in allowed:
+            raise ValueError(
+                f"批次状态不允许从 {current} 变成 {status}"
+                f"（批次 {self.batch_id}；允许的下一个状态：{'、'.join(allowed) or '无，已是终态'}）")
+        self.conn.execute(
+            "UPDATE batch SET status = ? WHERE batch_id = ?", (status, self.batch_id))
+        self.conn.commit()
+        return status
 
     def add(self, txn: Txn) -> DedupResult:
         """判定并写入一笔交易。identical 直接跳过，suspect 写入但标记待确认。"""
@@ -253,7 +360,15 @@ class Ledger:
 
     def finish_batch(self, parsed: int, declared: Optional[int],
                      inserted: int, identical: int, suspect: int,
-                     skipped: int, note: str = "") -> None:
+                     skipped: int, note: str = "",
+                     status: str = "committed") -> None:
+        """收尾：写统计 + 落最终状态。
+
+        状态先过状态机再写统计 —— 非法流转必须在这里就炸，
+        而不是先把统计写进去、状态留在半路上。
+        """
+        if status != self.batch_status():
+            self.set_batch_status(status)
         self.conn.execute(
             "UPDATE batch SET parsed=?, declared=?, inserted=?, identical=?,"
             " suspect=?, skipped=?, note=? WHERE batch_id=?",
