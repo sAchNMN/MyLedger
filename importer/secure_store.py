@@ -28,13 +28,29 @@
     with open_encrypted(vault_dir) as ledger:
         ...  # 退出 with 时自动加密落盘
 
+明文库迁移（ML-009）
+--------------------
+vault 里发现旧版留下的 `ledger.db` 时，会自动迁移一次，但**不是**
+「加密写出去就算完」：
+
+    1. 先核对源文件确实是账本（有 txn / batch 表），否则拒绝，一个字都不写
+    2. 迁移前算一份指纹（表清单 + 笔数 + 金额合计 + 时间范围 + 最大 id）
+    3. 写完密文，立刻把它当成陌生文件重新打开，再算一次指纹
+    4. 两次指纹不一致 → 删掉这份密文、原样保留明文、抛 MigrationError
+    5. 一致 → 把明文三件套（含 -wal / -shm）移入
+       `_plaintext_quarantine\\<时间戳>\\`（移动，不删除）
+
+之后每次打开账本都会检查一遍明文残留并强提醒 —— 安全提示只提醒一次等于没提醒。
+
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime
 from typing import Callable, Iterator, Optional
 
 from . import credentials
@@ -42,6 +58,9 @@ from .store import Ledger
 
 ENCRYPTED_NAME = "ledger.db.enc"
 PLAINTEXT_NAME = "ledger.db"
+
+# 迁移成功后，明文副本挪到这里（移动，不删除）。
+QUARANTINE_DIRNAME = "_plaintext_quarantine"
 
 # 一个 MyLedger 账本必须有的表。迁移前先核对，见 _require_ledger_schema。
 REQUIRED_TABLES = ("txn", "batch")
@@ -72,6 +91,86 @@ def plaintext_artifacts(vault_dir: str) -> list[str]:
     """
     plain = plaintext_path(vault_dir)
     return [p for p in (plain, f"{plain}-wal", f"{plain}-shm") if os.path.exists(p)]
+
+
+def quarantine_dir(vault_dir: str) -> str:
+    """隔离目录：迁移后明文副本的落脚点。"""
+    return os.path.join(vault_dir, QUARANTINE_DIRNAME)
+
+
+def find_residue(vault_dir: str) -> list[str]:
+    """vault 里所有还留着的明文副本：根目录下的三件套 + 隔离目录里的。
+
+    隔离目录必须一起算。「挪了个位置」不等于「数据消失了」，
+    而恰恰是这一步最容易骗过自己：文件不在原来的地方了，
+    于是以为已经处理过。
+    """
+    found = list(plaintext_artifacts(vault_dir))
+    box = quarantine_dir(vault_dir)
+    if os.path.isdir(box):
+        for name in sorted(os.listdir(box)):
+            entry = os.path.join(box, name)
+            if os.path.isdir(entry):
+                found.extend(sorted(os.path.join(entry, inner)
+                                    for inner in os.listdir(entry)))
+            else:
+                found.append(entry)
+    return found
+
+
+def quarantine_plaintext(vault_dir: str,
+                         warn: Callable[[str], None]) -> list[str]:
+    """把明文三件套移进 `vault\\_plaintext_quarantine\\<时间戳>\\`，返回新路径。
+
+    为什么是移动而不是删除：密文刚刚校验过（见 _verify_encrypted_copy），
+    理论上可以删了 —— 但「校验逻辑说它没问题」和「你敢替用户删掉他的账本」
+    是两件事，校验逻辑本身也可能有 bug。移动同样立刻消除了
+    「下次启动读到明文」的风险，而且真出事时数据还在。
+    真正的删除交给用户确认之后自己做。
+    """
+    paths = plaintext_artifacts(vault_dir)
+    if not paths:
+        return []
+
+    base = os.path.join(quarantine_dir(vault_dir),
+                        datetime.now().strftime("%Y%m%d-%H%M%S"))
+    target, suffix = base, 1
+    while os.path.exists(target):          # 同一秒里连迁两次也不能互相覆盖
+        suffix += 1
+        target = f"{base}.{suffix}"
+    os.makedirs(target)
+
+    moved: list[str] = []
+    for path in paths:
+        dest = os.path.join(target, os.path.basename(path))
+        try:
+            shutil.move(path, dest)
+            moved.append(dest)
+        except OSError as exc:
+            warn(f"！移动明文副本失败：{path}（{exc}）")
+    return moved
+
+
+def _warn_residue(vault_dir: str, warn: Callable[[str], None]) -> list[str]:
+    """每次打开账本都检查一遍明文残留，有就响亮地提醒。
+
+    为什么必须每次提醒（ML-009）：原来的实现只在迁移那一次打印一句
+    「明文文件不会被自动删除，请你手动处理它」，之后就再也没人提过。
+    而人不会因为一句提示就立刻去删文件 —— 于是「迁移完成」实际变成了
+    「明文永久留在那里，而且再也没人提醒」。安全提示只提醒一次等于没提醒。
+    """
+    residue = find_residue(vault_dir)
+    if not residue:
+        return []
+    warn("！vault 里还有明文副本，账本等于没加密：")
+    for path in residue:
+        warn(f"    {path}")
+    warn("  在删掉之前，任何能读到这个目录的人都能读到你的全部账目。")
+    warn("  确认密文一切正常之后，用下面这条删掉它们"
+         "（只删上面列的明文副本，不动加密账本）：")
+    warn("    Remove-Item -LiteralPath "
+         + ",".join(f"'{p}'" for p in residue) + " -Recurse -Force")
+    return residue
 
 
 def ledger_fingerprint(conn) -> dict:
@@ -214,6 +313,10 @@ def open_ledger(vault_dir: str, *, warn: Callable[[str], None] = print) -> Ledge
     enc = encrypted_path(vault_dir)
 
     if os.path.exists(enc):
+        # 加密账本已经在了，那明文的出现只可能是三种情况：
+        # 迁移残留、用户自己拷回来的、从备份恢复出来的。
+        # 三种都值得每次提醒一遍 —— 见 _warn_residue 的注释。
+        _warn_residue(vault_dir, warn)
         with open(enc, "rb") as fh:
             blob = fh.read()
         try:
@@ -295,6 +398,17 @@ def open_ledger(vault_dir: str, *, warn: Callable[[str], None] = print) -> Ledge
         warn(f"  已迁移到 {enc}")
         warn(f"  校验通过：{before['txn']} 笔，合计 {before['total']} 元，"
              f"时间范围 {before['first_ts']} ~ {before['last_ts']}")
+
+        # 校验过了才敢动明文。挪进隔离目录，不删除 —— 见函数注释。
+        moved = quarantine_plaintext(vault_dir, warn)
+        if moved:
+            warn(f"  明文副本已移入隔离目录（{len(moved)} 个文件，没有删除）：")
+            for path in moved:
+                warn(f"    {path}")
+            warn("  请先确认加密账本能正常打开；确认之后再删掉隔离目录，"
+                 "否则账本等于没加密。")
+        else:
+            warn("（没有找到明文文件，可能是刚才已经被移走了）")
         return ledger
 
     # 全新账本

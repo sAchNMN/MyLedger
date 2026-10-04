@@ -83,11 +83,13 @@ P2/P3、依赖锁定、测试入口统一等工程化项**本轮不动**。
 
 | 块 | 内容 | 涉及文件 | 状态 |
 |---|---|---|---|
-| D1 | 迁移后校验密文可独立打开：schema + 笔数 + 金额合计；同时检测 `-wal/-shm` | `importer/secure_store.py` | ⬜ |
-| D2 | 校验通过后把明文三件套移入隔离目录（不删），残留每次启动强提醒 | `importer/secure_store.py`、`importer/cli.py` | ⬜ |
+| D1 | 迁移后校验密文可独立打开：schema + 笔数 + 金额合计；同时检测 `-wal/-shm` | `importer/secure_store.py` | ✅ |
+| D2 | 校验通过后把明文三件套移入隔离目录（不删），残留每次启动强提醒 | `importer/secure_store.py`、`importer/cli.py` | ✅ |
 
 验收（合成数据）：合成明文库 → 迁移 → 明文主文件与 `-wal/-shm` 都进隔离目录 →
 密文重新打开后笔数与金额合计一致 → 迁移失败时明文原样保留。
+**已通过**：`tests/test_store_migration.py`（含用打桩 `protect()` 制造坏密文、
+冒名顶替的 sqlite 文件、手动把明文拷回来、`store` 子命令的报告）。
 
 ### 阶段 E —— ML-010 原始交易行完整入库（P1）
 

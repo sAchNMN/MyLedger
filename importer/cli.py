@@ -153,13 +153,18 @@ def cmd_store(args) -> int:
     print("加密方式   : Windows DPAPI（CryptProtectData），绑定当前 Windows 用户")
     print("             运行时整个库在内存，退出时加密落盘，明文不碰硬盘")
 
-    if info["plaintext_exists"]:
+    residue = secure_store.find_residue(vault)
+    if residue:
         print()
-        print(f"！发现明文库：{info['plaintext_path']}")
-        for path in info["wal_files"]:
-            print(f"！   附属文件：{path}")
-        print("  下次导入时会自动迁移到加密存储，但**明文文件不会被自动删除**。")
-        print("  迁移完成后请手动删掉它们——留着等于账本没加密。")
+        print("！还有明文副本，账本等于没加密：")
+        for path in residue:
+            print(f"    {path}")
+        if info["plaintext_exists"]:
+            print("  下次打开账本时会自动迁移并校验，"
+                  "然后把明文移入 _plaintext_quarantine（移动，不删除）。")
+            print("  迁移失败时明文会原样保留，不会被挪走。")
+        print("  先确认加密账本能正常打开，再删掉上面这些路径：")
+        print("    Remove-Item -LiteralPath '<上面列的路径>' -Recurse -Force")
 
     if info["encrypted_exists"]:
         print()

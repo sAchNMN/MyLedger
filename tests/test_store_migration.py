@@ -124,9 +124,11 @@ def run(tmp: str) -> int:
     print("=" * 78)
     print("迁移写完的密文，本次运行内就校验过（不是等下次打开才发现坏）")
     print("=" * 78)
-    check("明文仍在（这一步不负责处置，D2 才隔离）", os.path.exists(plain), True)
+    check("vault 根目录里已经没有裸的明文", os.path.exists(plain), False)
+    check("但也没被删掉（挪进了隔离目录）",
+          len(secure_store.find_residue(vault)), 1)
     info = secure_store.status(vault)
-    check("status 报告明文存在", info["plaintext_exists"], True)
+    check("status 报告 vault 根下没有明文了", info["plaintext_exists"], False)
     check("status 报告附属文件列表（可能为空）", isinstance(info["wal_files"], list), True)
 
     print()
@@ -195,6 +197,94 @@ def run(tmp: str) -> int:
     check("status 里的附属文件",
           sorted(os.path.basename(p) for p in secure_store.status(vault4)["wal_files"]),
           ["ledger.db-shm", "ledger.db-wal"])
+
+    print()
+    print("=" * 78)
+    print("明文隔离：迁移成功后，明文不再是 vault 根目录里的裸文件")
+    print("=" * 78)
+    vault5 = os.path.join(tmp, "vault-quarantine")
+    plain5 = secure_store.plaintext_path(vault5)
+    make_plaintext(plain5)
+    messages: list[str] = []
+    with secure_store.open_ledger(vault5, warn=messages.append) as led:
+        check("迁移后内容正确", secure_store.ledger_fingerprint(led.conn)["txn"], 3)
+    check("明文主文件已不在 vault 根", os.path.exists(plain5), False)
+    check("-wal / -shm 也不在 vault 根",
+          [os.path.exists(plain5 + s) for s in ("-wal", "-shm")], [False, False])
+    box = secure_store.quarantine_dir(vault5)
+    check("隔离目录建好了", os.path.isdir(box), True)
+    stamps = sorted(os.listdir(box)) if os.path.isdir(box) else []
+    check("有一个隔离批次", len(stamps), 1)
+    inside = sorted(os.listdir(os.path.join(box, stamps[0]))) if stamps else []
+    check("是移动不是删除（文件还在）", inside, ["ledger.db"])
+    check("隔离文件有内容",
+          os.path.getsize(os.path.join(box, stamps[0], "ledger.db")) > 0, True)
+    check("迁移过程里说明了处置办法",
+          any("隔离" in m for m in messages), True)
+
+    print()
+    print("=" * 78)
+    print("残留提醒：每次启动都提醒，不能只提醒一次")
+    print("=" * 78)
+    again: list[str] = []
+    with secure_store.open_ledger(vault5, warn=again.append):
+        pass
+    check("再次打开仍然强提醒", any("明文副本" in m for m in again), True)
+    check("提醒里点名了具体位置",
+          any("_plaintext_quarantine" in m for m in again), True)
+    check("提醒里告诉人怎么删",
+          any("Remove-Item" in m for m in again), True)
+
+    residue = secure_store.find_residue(vault5)
+    check("隔离目录算作残留", len(residue), 1)
+    check("残留路径指向那份文件", residue[0].endswith("ledger.db"), True)
+
+    print()
+    print("=" * 78)
+    print("store 子命令必须把残留说出来")
+    print("=" * 78)
+    import contextlib  # noqa: E402
+    import io  # noqa: E402
+
+    from importer import cli  # noqa: E402
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.main(["store", "--vault", vault5])
+    printed = buf.getvalue()
+    check("退出码", code, 0)
+    check("说了还有明文副本", "还有明文副本" in printed, True)
+    check("给出了删除命令", "Remove-Item" in printed, True)
+
+    print()
+    print("=" * 78)
+    print("用户手动把明文拷回来：照样被认出来并提醒")
+    print("=" * 78)
+    shutil.copy2(residue[0], plain5)
+    residue = secure_store.find_residue(vault5)
+    check("两份残留都被列出来", len(residue), 2)
+    back: list[str] = []
+    with secure_store.open_ledger(vault5, warn=back.append):
+        pass
+    check("提醒里同时点名 vault 根目录下的明文",
+          any(os.path.basename(m.rstrip()) == "ledger.db" and "vault-quarantine" in m
+              for m in back), True)
+
+    print()
+    print("=" * 78)
+    print("迁移校验失败时不得隔离明文（数据还没被证明安全）")
+    print("=" * 78)
+    vault6 = os.path.join(tmp, "vault-fail-noquarantine")
+    plain6 = secure_store.plaintext_path(vault6)
+    make_plaintext(plain6)
+    credentials.protect = lambda data: b"still not a dpapi blob"
+    try:
+        check_raises("坏密文", lambda: secure_store.open_ledger(vault6))
+    finally:
+        credentials.protect = real_protect
+    check("明文仍在 vault 根目录", os.path.exists(plain6), True)
+    check("没有建隔离目录",
+          os.path.isdir(secure_store.quarantine_dir(vault6)), False)
 
     print()
     print("=" * 78)
