@@ -33,13 +33,16 @@ P2/P3、依赖锁定、测试入口统一等工程化项**本轮不动**。
 
 | 块 | 内容 | 涉及文件 | 状态 |
 |---|---|---|---|
-| A1 | `batch` 表增加 `status` 列 + 状态流转（含老库 `ALTER` 迁移） | `importer/store.py` | ⬜ |
-| A2 | `ImportOutcome` 加状态机，`ok` 由 `status` 派生 | `importer/pipeline.py` | ⬜ |
-| A3 | 只有 `success` 才允许移动源文件；失败留在原地并给重试说明 | `importer/monthly.py` | ⬜ |
-| A4 | `import` 子命令报告部分失败 + 退出码 | `importer/cli.py` | ⬜ |
+| A1 | `batch` 表增加 `status` 列 + 状态流转（含老库 `ALTER` 迁移） | `importer/store.py` | ✅ |
+| A2 | `ImportOutcome` 加状态机，`ok` 由 `status` 派生 | `importer/pipeline.py` | ✅ |
+| A3 | 只有 `success` 才允许移动源文件；失败留在原地并给重试说明 | `importer/monthly.py` | ✅ |
+| A4 | `import` 子命令报告部分失败 + 退出码 | `importer/cli.py` | ✅ |
+| A0 | （测试抓出来的额外缺陷）同一秒重跑同一文件 `batch_id` 撞主键 | `importer/store.py` | ✅ |
 
 验收（合成数据）：3 笔交易、第 2 笔故意写失败 → 源文件仍在原地、批次为
-`partial_failed`、重跑不产生重复。
+`partial_failed`、重跑不产生重复。**已通过**：
+`tests/test_batch_status.py`、`tests/test_import_state.py`、
+`tests/test_monthly_archive.py`、`tests/test_cli_import.py`（失败注入用真实 SQLite 触发器）。
 
 ### 阶段 B —— ML-007 / ML-004 原始交易内容进入日志（P1 + P2）
 

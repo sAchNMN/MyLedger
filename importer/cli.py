@@ -68,21 +68,37 @@ def cmd_import(args) -> int:
                 archive=args.archive, dry_run=args.dry_run,
             ))
 
-    ok = [o for o in outcomes if o.ok]
-    bad = [o for o in outcomes if not o.ok]
+    # 三种结局分开对待（ML-006）。
+    #
+    # 「部分失败」不等于「没导入成功」：库里已经有几笔了。说成没导入，
+    # 人会以为白跑一趟，然后重新导一遍、或者干脆把源文件删了 —— 而那份文件
+    # 正是失败那几笔唯一的重试依据。两种情况的退出码都是非零（上游要报警），
+    # 但文案必须让人一眼分出「什么都没进去」和「进去了一半」。
+    partial = [o for o in outcomes if o.status == "partial_failed"]
+    bad = [o for o in outcomes if not o.ok and o.status != "partial_failed"]
+    suspects = sum(o.suspect for o in outcomes if o.ok)
 
     print("=" * 72)
+    if partial:
+        print(f"有 {len(partial)} 个文件只导入了一部分（源文件仍在原处）：")
+        for o in partial:
+            print(f"  {o.path}")
+            print(f"    {o.error}")
+            print(f"    已入库 {o.inserted + o.identical} 笔，失败 {len(o.failed_rows)} 笔。")
+            print("    补完问题后重跑同一个文件即可：已入库的会按单号/指纹跳过。")
     if bad:
         print(f"有 {len(bad)} 个文件没导入成功：")
         for o in bad:
             print(f"  {o.path}")
-            print(f"    原因：{o.error}")
-    suspects = sum(o.suspect for o in ok)
+            print(f"    {o.status_label}：{o.error}")
     if suspects:
         print(f"有 {suspects} 笔疑似重复，用大按钮界面确认最快：")
         print("  python -m importer review --ui")
-    print(f"本次共写入 {sum(o.inserted for o in ok)} 笔。")
-    return 2 if bad else 0
+    print(f"本次共写入 {sum(o.inserted for o in outcomes)} 笔。")
+    if partial:
+        print(f"！这 {len(partial)} 个文件没有全部导入成功，不要把源文件删掉或挪走 ——")
+        print("  它们是失败那几笔唯一的重试依据。")
+    return 2 if (bad or partial) else 0
 
 
 # --------------------------------------------------------------------------
