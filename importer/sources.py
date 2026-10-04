@@ -101,6 +101,37 @@ def _resolve_ts(raw: str):
     return value
 
 
+# --------------------------------------------------------------------------
+# raw 里允许放什么（ML-010）
+#
+# 以前 raw 是 {"来源":…, "编码":…, "数据行":…, "原始": row} —— 整行原样入库。
+# 账本因此变成「账单的一份完整副本 + 一份解析结果」：报表用不到的列
+# （对方账号、交易分类原文、平台随手加的扩展列）全都被永久保存下来。
+# 更麻烦的是它的性质：raw 看起来像调试信息，所以没人会去清理它。
+#
+# 现在 raw 只留三种东西：
+#   1. 来源信息：从哪来、什么编码、第几行
+#   2. 形状摘要：这一行有几个字段、几个非空、关键列有没有值
+#   3. 方向列的值 —— 唯一保留的原始单元格值，因为 fixups 靠它重推收支方向，
+#      而它的取值只有「支出 / 收入 / 不计收支」这几种固定词
+#
+# 形状摘要的用处很具体：「11 个字段但金额列是空的」和「只有 2 个字段」
+# 是两种完全不同的故障（导出格式变了 / 切错了列），也都能一眼看出来，
+# 但这两组数字说不出任何一笔消费。
+# --------------------------------------------------------------------------
+
+def _row_summary(row: list[str], index: Optional[dict] = None) -> dict:
+    summary = {
+        "字段数": len(row),
+        "非空字段数": sum(1 for cell_value in row if cell_value),
+    }
+    if index:
+        # 银行截图 / PDF 那条路没有「列」的概念（靠字段长相认列），这两项没意义
+        summary["金额列有值"] = bool(cell(row, index, "amount"))
+        summary["时间列有值"] = bool(cell(row, index, "ts"))
+    return summary
+
+
 def _parse_rows(
     rows: list[list[str]],
     aliases: dict,
@@ -185,7 +216,7 @@ def _parse_rows(
                 "表头行": header_row + 1,
                 "数据行": row_no + 1,
                 "方向列": cell(row, index, "direction"),   # 供 fixups 重推方向用
-                "原始": row,
+                **_row_summary(row, index),
             },
         ))
 
@@ -400,7 +431,8 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
             txn_id="",              # 截图里通常没有可用的流水号，靠内容指纹去重
             merchant_order_id="",
             note="；".join(notes),
-            raw={"来源": origin, "编码": encoding, "数据行": row_no, "原始": row},
+            raw={"来源": origin, "编码": encoding, "数据行": row_no,
+                 **_row_summary(row)},
         ))
 
     if year_guessed:
