@@ -352,6 +352,75 @@ def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
 BACKUP_KEEP = 3
 
 
+# --------------------------------------------------------------------------
+# OCR 产物的保留期限（ML-011）
+#
+# OCR 会留下三份中间文件：<名字>.raw.txt / .rows.tsv / .ocr.log。
+# 它们的问题在于**身份模糊**：既是明文的账单副本，又不在账本里、
+# 不加密、不会被 recompute 清点、也没有任何人记得它们存在。
+# 半年后的截图 OCR 产物留在硬盘上，和把账单抄了一份放在那边没什么区别。
+#
+# 所以给它们一个期限。默认 7 天：够一次「跑完 OCR → 导入 → 发现不对重来一遍」
+# 的时间，之后就没用了。
+# --------------------------------------------------------------------------
+
+OCR_ARTIFACT_SUFFIXES = (".raw.txt", ".rows.tsv", ".ocr.log")
+OCR_KEEP_DAYS = 7
+OCR_ROTATION_DIRNAME = "MyLedger-ocr-rotation"
+
+
+def cleanup_ocr_artifacts(out_dir: str, keep_days: int = OCR_KEEP_DAYS,
+                          emit: Callable[[str], None] = print) -> list[str]:
+    """把超过 `keep_days` 天的 OCR 产物移走，返回被移走的文件名。
+
+    为什么是「移动」：和备份轮转同一条纪律。TEMP 会被系统回收，
+    而 vault 里的东西一旦删掉就没有第二次机会。
+    keep_days 传 0 或负数表示不清理。
+    """
+    if keep_days is None or keep_days <= 0:
+        return []
+    try:
+        names = sorted(os.listdir(out_dir))
+    except OSError:
+        return []                            # 目录不存在（还没跑过 OCR）很正常
+
+    cutoff = datetime.now().timestamp() - keep_days * 86400
+    old = [n for n in names
+           if n.endswith(OCR_ARTIFACT_SUFFIXES) and _mtime_ok(out_dir, n, cutoff)]
+    if not old:
+        return []
+
+    try:
+        target_dir = os.path.join(tempfile.gettempdir(), OCR_ROTATION_DIRNAME)
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        emit(f"  （临时目录不可用，OCR 产物先留着：{type(exc).__name__}）")
+        return []
+
+    moved: list[str] = []
+    for name in old:
+        try:
+            dst = os.path.join(target_dir, name)
+            if os.path.exists(dst):
+                os.remove(dst)
+            shutil.move(os.path.join(out_dir, name), dst)
+            moved.append(name)
+        except OSError as exc:
+            # 单个移不动不影响别的；也绝不能因此让导入环节失败
+            emit(f"  （{name} 没挪走：{exc.strerror or type(exc).__name__}）")
+    if moved:
+        emit(f"  已把 {len(moved)} 份超过 {keep_days} 天的 OCR 产物移到 {target_dir}")
+    return moved
+
+
+def _mtime_ok(out_dir: str, name: str, cutoff: float) -> bool:
+    """够老了（并且读得到时间）。读不到时间的一概当作新的，不动它。"""
+    try:
+        return os.path.getmtime(os.path.join(out_dir, name)) < cutoff
+    except OSError:
+        return False
+
+
 def _rotation_dir() -> str:
     """旧备份的去处。放在系统临时目录，由 Windows 自己回收。"""
     folder = os.path.join(tempfile.gettempdir(), "MyLedger-backup-rotation")

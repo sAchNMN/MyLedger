@@ -719,7 +719,16 @@ def cmd_ocr(args) -> int:
     cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
            "-File", script, "-OutDir", out_dir] + args.images
     print("调用本地 OCR（Windows 自带引擎，不联网）……")
-    return subprocess.call(cmd)
+    code = subprocess.call(cmd)
+
+    # 顺手给旧产物一个期限（ML-011）。放在 OCR 之后是因为：清理的是**之前**
+    # 留下的文件，当次的产物还热着，不会被自己清掉 —— 也不该被清掉，
+    # 那正是接下来要导入的东西。
+    try:
+        fixups.cleanup_ocr_artifacts(out_dir, keep_days=args.cleanup_days)
+    except Exception as exc:                 # noqa: BLE001 - 善后不许反过来搞砸主流程
+        print(f"  （OCR 产物清理跳过：{type(exc).__name__}）")
+    return code
 
 
 # --------------------------------------------------------------------------
@@ -929,6 +938,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("ocr", help="银行截图 → TSV（调本地 Windows OCR）")
     p.add_argument("images", nargs="+")
     p.add_argument("--out", default=None)
+    p.add_argument("--cleanup-days", type=int, default=fixups.OCR_KEEP_DAYS,
+                   metavar="N",
+                   help=f"跑完顺手把超过 N 天的 OCR 产物移出 vault"
+                        f"（默认 {fixups.OCR_KEEP_DAYS} 天；0 表示不清理）")
     p.set_defaults(func=cmd_ocr)
 
     return parser
