@@ -132,6 +132,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\install-git-hooks.ps
 MYLEDGER_ALLOW_SENSITIVE=YES_I_AM_SURE git commit -m "..."
 ```
 
+**绕过会留痕（2026-10-05 起）。** 出口保留，但每次绕过都会往
+**`.workbuddy/audit/gate-bypass.log`** 追加一条记录：时间、分支、提交者、
+命中了几条规则、以及被放行的具体内容。为什么必须有这一步：
+
+- 绕过一次是应急，绕过一百次是防线失效 —— 而这两种情况原本
+  **事后看到的证据完全一样**。
+- 这个文件在 `.workbuddy/` 下，**不进仓库、不会被推送**，也不会被人从历史里翻出来。
+  它的用途是事后自查，不是追责。
+
+万一那个目录写不进去，会依次退到用户目录和 `.git\`；实在都写不了，钩子会在终端里
+明说「这次绕过没有留下痕迹」，但**不会**因此挡住你的提交 —— 记录不该变成放行条件。
+
 `core.hooksPath` 是本地配置，不随仓库推送。**换机器或重新克隆后，必须重新跑一次 `setup.cmd`**，否则闸门不存在。
 
 ### 3.3 设备层：BitLocker（本机决定不开，2026-10-05）
