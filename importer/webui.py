@@ -559,6 +559,7 @@ function show(tab) {
   document.querySelectorAll("#nav button").forEach(b =>
     b.classList.toggle("on", b.dataset.tab === tab));
   document.querySelectorAll(".tab").forEach(t => t.classList.toggle("on", t.id === "tab-" + tab));
+  if (tab === "import") renderImport();
   if (tab === "review") renderReview();
   if (tab === "report") renderReport();
   if (tab === "unmatched") renderUnmatched();
