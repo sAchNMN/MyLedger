@@ -78,12 +78,47 @@ def looks_like_xlsx(data: bytes) -> bool:
     return any(n.startswith("xl/") for n in names) or "[Content_Types].xml" in names
 
 
-def open_source(path: str, password: Optional[str] = None) -> tuple[bytes, str]:
-    """读取源文件；如果是账单压缩包，自动取出里面的账单文件。
+TABLE_SUFFIXES = (".csv", ".txt", ".xlsx", ".xlsm")
+DOCUMENT_SUFFIXES = TABLE_SUFFIXES + (".tsv", ".pdf")
 
-    支付宝/微信的账单经常是以「带密码的 zip」形式下载的，
-    所以这里必须支持 zip 解包，否则用户每次都要手动解压一遍。
-    返回 (内容字节, 来源说明)。
+
+def _read_from_zip(zf, names: list, password: Optional[str]) -> tuple[bytes, str]:
+    """从压缩包里取出第一份能读出来的文档。返回 (字节, 包内路径)。
+
+    先试用户给的密码，再试无密码（有些包不加密）。
+    """
+    passwords: list[Optional[bytes]] = []
+    if password:
+        passwords.append(password.encode("utf-8"))
+    passwords.append(None)
+
+    last_error: Optional[Exception] = None
+    for name in names:
+        for pwd in passwords:
+            try:
+                return zf.read(name, pwd=pwd), name
+            except RuntimeError as exc:      # 密码错误 / 需要密码
+                last_error = exc
+            except Exception as exc:          # 其他损坏情况
+                last_error = exc
+
+    raise ValueError(
+        f"压缩包 {zf.filename} 解不开：需要密码，或给定密码不对。"
+        f"下载账单时支付宝/微信会让你设置一个密码，用 --password 传进来。"
+        f"（原始错误：{last_error}）"
+    )
+
+
+def open_document(path: str, password: Optional[str] = None,
+                  suffixes: tuple = DOCUMENT_SUFFIXES) -> tuple[bytes, str]:
+    """读取任意账单源文件，返回 (内容字节, 来源说明)。
+
+    压缩包会被自动解开。suffixes 决定在包里找什么：
+        表格链路传 TABLE_SUFFIXES（csv/xlsx），
+        PDF 链路传 (".pdf",) —— 银行寄来的账单经常是「一个装 PDF 的 zip」，
+        只认表格的话会直接报「压缩包里没有找到 csv/xlsx 文件」。
+
+    裸文件（非压缩包）原样返回，suffixes 不参与判断。
     """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"找不到文件：{path}")
@@ -102,33 +137,25 @@ def open_source(path: str, password: Optional[str] = None) -> tuple[bytes, str]:
     zf = zipfile.ZipFile(io.BytesIO(data))
     candidates = [
         n for n in zf.namelist()
-        if not n.endswith("/") and n.lower().endswith((".csv", ".txt", ".xlsx", ".xlsm"))
+        if not n.endswith("/") and n.lower().endswith(tuple(suffixes))
     ]
     if not candidates:
-        raise ValueError(f"压缩包 {os.path.basename(path)} 里没有找到 csv/xlsx 文件")
+        wanted = "/".join(suffixes)
+        raise ValueError(f"压缩包 {os.path.basename(path)} 里没有找到 {wanted} 文件")
 
-    # 先试用户给的密码，再试无密码（有些包不加密）
-    passwords: list[Optional[bytes]] = []
-    if password:
-        passwords.append(password.encode("utf-8"))
-    passwords.append(None)
+    content, name = _read_from_zip(zf, candidates, password)
+    return content, f"压缩包内 {name}"
 
-    last_error: Optional[Exception] = None
-    for name in candidates:
-        for pwd in passwords:
-            try:
-                content = zf.read(name, pwd=pwd)
-                return content, f"压缩包内 {name}"
-            except RuntimeError as exc:      # 密码错误 / 需要密码
-                last_error = exc
-            except Exception as exc:          # 其他损坏情况
-                last_error = exc
 
-    raise ValueError(
-        f"压缩包 {os.path.basename(path)} 解不开：需要密码，或给定密码不对。"
-        f"下载账单时支付宝/微信会让你设置一个密码，用 --password 传进来。"
-        f"（原始错误：{last_error}）"
-    )
+def open_source(path: str, password: Optional[str] = None) -> tuple[bytes, str]:
+    """读取源文件；如果是账单压缩包，自动取出里面的**表格**文件。
+
+    支付宝/微信的账单经常是以「带密码的 zip」形式下载的，
+    所以这里必须支持 zip 解包，否则用户每次都要手动解压一遍。
+    PDF 不在这条链路上（走 bank_pdf），所以只找表格类后缀。
+    返回 (内容字节, 来源说明)。
+    """
+    return open_document(path, password, TABLE_SUFFIXES)
 
 
 # --------------------------------------------------------------------------

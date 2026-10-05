@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import os
+import zipfile
 from typing import Optional
 
 
@@ -126,16 +127,38 @@ def _cluster_rows(words, row_tolerance: float = 0.6, gap_ratio: float = 0.8):
 
 
 def extract_rows(path: str, password: Optional[str] = None) -> tuple[list[list[str]], dict]:
-    """抽出 (二维表, 元信息)。元信息里不含任何账单内容。"""
+    """抽出 (二维表, 元信息)。元信息里不含任何账单内容。
+
+    path 可以是裸 PDF，也可以是「装着 PDF 的 zip」——
+    银行寄来的账单经常是后者，那种情况下 pymupdf.open(path)
+    会安静地开出一个 0 页的空文档（实测），比直接报错更坏：
+    后面会因为「抽不到文字层」误判成扫描件。
+    所以这里先判断是不是压缩包，是就取出里面的 PDF 字节再开。
+    """
     pymupdf = _require_pymupdf()
 
     if not os.path.isfile(path):
         raise PdfError(f"找不到文件：{path}")
 
-    try:
-        doc = pymupdf.open(path)
-    except Exception as exc:
-        raise PdfError(f"打不开 PDF：{exc}") from exc
+    if zipfile.is_zipfile(path):
+        from .sniff import open_document
+        try:
+            data, origin = open_document(path, password, (".pdf",))
+        except Exception as exc:
+            raise PdfError(
+                f"这个压缩包里取不出 PDF：{exc}\n"
+                f"  确认它是银行寄来的账单包（里面应该是 .pdf），"
+                f"并且密码填对了。"
+            ) from exc
+        try:
+            doc = pymupdf.open(stream=data, filetype="pdf")
+        except Exception as exc:
+            raise PdfError(f"压缩包里的 PDF 打不开：{exc}") from exc
+    else:
+        try:
+            doc = pymupdf.open(path)
+        except Exception as exc:
+            raise PdfError(f"打不开 PDF：{exc}") from exc
 
     meta = {
         "pages": doc.page_count,

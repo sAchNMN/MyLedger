@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import datetime as dt
 import re
+import zipfile
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
@@ -486,6 +487,18 @@ def detect_source(path: str) -> str:
     # PDF 一律当银行账单。支付宝/微信导出的是 csv/xlsx/zip，不会是 PDF。
     if name.endswith(".pdf"):
         return "bank_pdf"
+
+    # 「装着 PDF 的 zip」也当银行账单。银行寄账单喜欢包一层：
+    # 文件名就是一堆数字，既不含渠道关键词，也不是 .pdf 后缀，
+    # 靠下面的表头探测必然失败（zip 里没有表头）。
+    if zipfile.is_zipfile(path):
+        try:
+            with zipfile.ZipFile(path) as zf:
+                inner = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+            if inner:
+                return "bank_pdf"
+        except Exception:
+            pass        # 读不了就当普通压缩包，交给后面按表头判断
 
     if "支付宝" in name or "alipay" in name:
         return "alipay"

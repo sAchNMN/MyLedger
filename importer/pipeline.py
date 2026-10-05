@@ -124,7 +124,7 @@ def import_file(
     outcome.source = source if source != "auto" else detect_source(path)
     if outcome.source not in PARSERS:
         outcome.status = "parse_failed"
-        outcome.error = "无法识别数据源（用 --source alipay|wechat|bank 手动指定）"
+        outcome.error = "无法识别数据源（用 --source alipay|wechat|bank_pdf 手动指定）"
         emit(f"无法识别数据源：{path}")
         return outcome
 
