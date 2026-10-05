@@ -214,7 +214,16 @@ DEFAULT_AI_MODEL = "qwen2.5:7b"
 def _assert_local(url: str) -> None:
     """硬闸门：只允许连本机。整个工具不允许任何形式的联网。"""
     from urllib.parse import urlparse
-    host = (urlparse(url).hostname or "").lower()
+    parts = urlparse(url)
+    # URL 里带 userinfo 一律拒：本机模型不需要用户名密码。
+    # 「evil.com@127.0.0.1」这种写法虽然 urlparse 解析出的 hostname 仍是
+    # 127.0.0.1（连的本机），但它会把一串凭据塞进 Authorization 头里。
+    # 没有正当场景需要它，拒掉比判断「这算不算安全」省事。
+    if parts.username or parts.password:
+        raise ValueError(
+            "拒绝连接：地址里带了用户名/密码，本机模型不需要凭据。"
+        )
+    host = (parts.hostname or "").lower()
     if host not in LOCAL_AI_HOSTS:
         raise ValueError(
             f"拒绝连接 {host}：本工具的 AI 分类只允许本地模型。"
@@ -223,8 +232,15 @@ def _assert_local(url: str) -> None:
 
 
 def ai_available(url: str = DEFAULT_AI_URL, timeout: float = 1.5) -> bool:
+    """本机模型在不在。地址不合法时**抛出**，不伪装成「没响应」。
+
+    `_assert_local` 刻意放在 try 外面：它抛的 ValueError 说的是
+    「拒绝连这个地址」，和「对方没开机」是完全不同的两件事，
+    处置方式也相反（改配置 vs 去装 Ollama）。
+    把它混进 catch-all 里，用户会照着「模型没响应」去反复重启服务。
+    """
+    _assert_local(url)
     try:
-        _assert_local(url)
         req = urllib.request.Request(url.rstrip("/") + "/api/tags")
         with urllib.request.urlopen(req, timeout=timeout):
             return True
@@ -402,12 +418,34 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
     if not require_ac(f"本地 AI 分类（{len(unmatched)} 个未识别商户）", override=ignore_power):
         return stats
 
-    if not ai_available(ai_url):
+    try:
+        reachable = ai_available(ai_url)
+    except ValueError as exc:
+        # 地址不合法：把拒绝的原因原样说出来，然后跳过 AI，不要崩掉整轮
+        print(f"{exc}")
+        return stats
+    if not reachable:
         print(f"本地模型没响应（{ai_url}）。想用 AI 分类的话先装 Ollama 并拉一个模型：")
         print(f"  ollama pull {ai_model}")
         return stats
 
     merchants = sorted(unmatched)
+
+    # ML-005：把「数据要去哪」先说清楚，再真的发。
+    #
+    # 这里刻意**不**对商户名做遮罩。AI 分类的全部依据就是商户名 ——
+    # 遮掉其中任何一个字，模型就认不出这是哪家店，这个功能等于被阉割掉。
+    # （对比 `unmatched --mask`：那个输出是给人列的清单，脱敏无副作用。）
+    #
+    # 所以能做的只有两件事：**发之前讲明白代价**，以及确保不要扩散到第二处。
+    # 后者已经成立：AuditLog 的白名单里只有 `ai` 这个布尔值，
+    # 商户名不会进本项目自己的任何日志。剩下的风险在 Ollama 那侧。
+    print(f"把 {len(merchants)} 个未识别商户的**商户名**发给本机模型 {ai_model}（{ai_url}）。")
+    print("  为什么必须发完整名称：遮掉任何一个字，模型就认不出这是哪家店，")
+    print("  分类也就没用了 —— 这条路要么完整发，要么别开。")
+    print("  代价：这些名字会以明文留在 Ollama 自己的日志里（不加密，也没有清理期限）。")
+    print("  更保守的路：不开 AI，用 unmatched 看一眼 + setcat 指定，商户名一步都不出本项目。")
+
     print(f"调用本地模型 {ai_model} 分类 {len(merchants)} 个商户……")
     mapping: dict[str, str] = {}
     # 分批，避免一次塞太多把上下文撑爆
