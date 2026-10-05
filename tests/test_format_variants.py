@@ -223,6 +223,61 @@ def case_more_rows_than_expected():
     check("带标题/账户行/区间行时仍解析 28 笔", len(r2.txns), 28)
 
 
+def case_semantic_fallback():
+    print("\n[6] 列名不在别名表里时按语义兜底（否则「大部分对、一项空」）")
+    from importer.sniff import build_index
+    from importer.sources import BANK_PDF_ALIASES
+
+    # 实测事故：农行活期明细表头第 5 列的叫法没进别名表，
+    # 于是 counterparty **整个字段消失** —— 而日期/金额/方向/渠道全对，
+    # 报表看起来完全正常，只有商户名是空的。**这种错最难查。**
+    # 实测那次折腾了好几轮：字坐标验过、列数验过、列映射验过，
+    # 最后才从 `index` 字典里发现少了 counterparty 这一项。
+    variants = [
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "对方信息", "日志号", "交易渠道", "交易附言"],
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "对方名称", "日志号", "交易渠道", "交易附言"],
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "对方账户名称", "日志号", "交易渠道", "交易附言"],
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "对手方信息", "日志号", "交易渠道", "交易附言"],
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "收款方名称", "日志号", "交易渠道", "交易附言"],
+        ["交易日期", "交易时间", "交易摘要", "交易金额", "本次余额",
+         "对手户名", "日志号", "交易渠道", "交易附言"],
+    ]
+    for header in variants:
+        idx = build_index(header, BANK_PDF_ALIASES)
+        check(f"认出第 5 列（表头写「{header[5]}」）", idx.get("counterparty"), 5)
+
+    # 端到端：列有内容时必须真的取到
+    header = variants[0]
+    row = ["20260928", "205056", "转账", "-2400.00", "2400.04",
+           "XX公积金中心", "", "LOG1", "掌上银行", "石桥环保公积金"]
+    result = _parse_rows([header, row], BANK_PDF_ALIASES, "bank_pdf", "x", "pdf", "")
+    check("解析出 1 笔", len(result.txns), 1)
+    check("对方取到值（不是空串）", result.txns[0].counterparty, "XX公积金中心")
+
+    # 兜底**不能**抢掉已经认对的列
+    idx = build_index(header, BANK_PDF_ALIASES)
+    check("amount 仍在第 3 列（没被兜底抢走）", idx["amount"], 3)
+    check("date 仍在第 0 列", idx["date"], 0)
+    # 注意：不同字段**允许**共用同一列 ——「交易摘要」同时是
+    # category_raw / item / note 的来源，这是设计如此（见 BANK_PDF_ALIASES
+    # 顶部注释：靠 dict 顺序决定谁先命中）。所以这里只验「兜底没抢走
+    # 金额列和日期列」，不去断言列与列一一对应。
+
+
+def case_fallback_not_for_strict_fields():
+    print("\n[7] 兜底不用于 ts/amount（那两个有严格校验，猜错会产出脏数据）")
+    import importer.sniff as sniff
+    check("语义兜底表里没有 ts", "ts" in sniff._SEMANTIC_FALLBACK, False)
+    check("语义兜底表里没有 amount", "amount" in sniff._SEMANTIC_FALLBACK, False)
+    check("语义兜底表里没有 direction", "direction" in sniff._SEMANTIC_FALLBACK, False)
+    check("语义兜底表里没有 txn_id", "txn_id" in sniff._SEMANTIC_FALLBACK, False)
+
+
 def main() -> int:
     print()
     print("=" * 78)
@@ -233,6 +288,8 @@ def main() -> int:
     case_fallback_not_failure()
     case_others_not_broken()
     case_more_rows_than_expected()
+    case_semantic_fallback()
+    case_fallback_not_for_strict_fields()
 
     print()
     print("=" * 78)

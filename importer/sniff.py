@@ -437,19 +437,84 @@ def header_names(row: list[str]) -> list[str]:
 
 
 def build_index(header: list[str], aliases: dict[str, tuple[str, ...]]) -> dict[str, int]:
-    """按别名表反查列下标。同一字段取第一个命中的列。"""
+    """按别名表反查列下标。同一字段取第一个命中的列。
+
+    匹配分两轮
+    ----------
+    第一轮：完全相等，或**别名有 3 个字以上且是列名的子串**。
+    3 个字是刻意的下限 ——「金额(元)」归一化后能精确相等，
+    而 2 个字（「对方」）用子串匹配会到处误命中（「对方账号」也会命中「对方」）。
+
+    第二轮（本轮新增）：**字都认不出来时的语义兜底。**
+    实测踩到的：一份农行活期明细，表头第 5 列写着「对方信息」，
+    `counterparty` 的别名表里明明有「对方信息」，但**整份解析出来的
+    交易对方全是空字符串** —— 而那列的内容明明在（8 个字）。
+    根因是第一轮要求「列名必须命中某个别名」，一旦银行用了别名表里
+    没有的叫法（各种「对方XX」），这个字段就整个消失，
+    而**其他字段全都正常**（日期、金额、方向、渠道全对）。
+
+    这种「大部分对、一项空」最难查 —— 报表看起来完全正常，
+    只有商户名是空的。所以第二轮按**关键词**兜底：
+    列名里含「对方」「收款方」「付款方」「商户」→ 当交易对方。
+    只在第一轮完全没命中时启用，**不会覆盖已经认对的列**。
+
+    这样做的取舍：宁可商户名认成「XX中心」这种可能不精确的值，
+    也不要留空 —— 留空会让所有按商户归类的规则失效，
+    而填错一个名字用户一眼能看出来，填空则什么都发现不了。
+    """
     index: dict[str, int] = {}
+    unmatched: list[str] = []
+
     for field, names in aliases.items():
+        hit = None
+        # ---- 第一轮：精确相等 / 长别名子串 ----
         for i, col in enumerate(header):
             if not col:
                 continue
             for name in names:
-                if col == name or (name in col and len(name) >= 3):
+                if col == name or (len(name) >= 3 and name in col):
+                    hit = i
+                    break
+            if hit is not None:
+                break
+        if hit is not None:
+            index[field] = hit
+        else:
+            unmatched.append(field)
+
+    # ---- 第二轮：语义兜底（只在第一轮没命中的字段上） ----
+    if unmatched and _SEMANTIC_FALLBACK:
+        for field in unmatched:
+            keys = _SEMANTIC_FALLBACK.get(field)
+            if not keys:
+                continue
+            for i, col in enumerate(header):
+                if not col or field in index:
+                    continue
+                # 别名表已经占用的列不再抢 —— 那列是别的字段
+                if i in index.values():
+                    continue
+                if any(k in col for k in keys):
                     index[field] = i
                     break
-            if field in index:
-                break
+
     return index
+
+
+# 字段 → 兜底关键词。
+#
+# 只放「这个字段在列名里几乎一定出现某个词」的项。
+# **刻意不放 ts/amount**：那两个有严格校验（时间解析、两位小数），
+# 猜错会直接产出脏数据；而 counterparty/item/method 这类
+# 是「文本描述」性质，猜错的代价只是名字不够精确。
+_SEMANTIC_FALLBACK = {
+    "counterparty": ("对方", "对手方", "对手", "收款方", "付款方", "商户",
+                     "收款人", "付款人", "交易方"),
+    "method": ("渠道", "方式", "途径"),
+    "item": ("摘要", "用途", "说明", "附言", "备注"),
+    "category_raw": ("类型", "分类", "摘要"),
+    "note": ("备注", "附言", "用途", "说明"),
+}
 
 
 def cell(row: list[str], index: dict[str, int], field: str) -> str:
