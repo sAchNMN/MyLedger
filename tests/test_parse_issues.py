@@ -31,9 +31,10 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(HERE))
 
+from importer import pipeline  # noqa: E402
 from importer.model import describe_issue  # noqa: E402
 from importer.pipeline import import_file  # noqa: E402
-from importer.sources import parse_alipay, parse_bank_ocr  # noqa: E402
+from importer.sources import _parse_bank_rows_auto, parse_alipay, parse_bank_ocr  # noqa: E402
 from importer.store import Ledger  # noqa: E402
 
 FAILURES: list[str] = []
@@ -193,6 +194,84 @@ def run(tmp: str) -> int:
     check("打印里有行号和错误类型", "第 6 行：金额字段格式无效" in printed, True)
     check("打印里没有 raw 字样", "raw" in printed, False)
     check("打印文本里一个标记串都没有", scan_for_markers(printed), [])
+
+    # ------------------------------------------------------------------
+    # 「0 笔」必须能区分两种原因
+    #
+    # 真实事故：用户导入银行 PDF（zip 里那份），AES 解密已经修好了，
+    # 但日志只有两句「解析成功 0 笔 / 跳过 0 行」，用户完全不知道该干什么。
+    #
+    # 那 0 笔有两种天差地别的来源：
+    #   A. 文件里连一行流水都没有（导出残缺）→ 重新导出就行
+    #   B. 文件里有行，但一个字段都没认出来    → 要调解析规则
+    # 以前两者报同一句话，处置方式却是相反的。
+    # 病根：`_parse_bank_rows_auto` 里 `if not dates: continue` 把行静默丢了，
+    # 连 skipped 都不记 —— 于是 B 情况下 skipped 也是空的，
+    # 和 A 完全无法区分。
+    # ------------------------------------------------------------------
+    print()
+    print("=" * 78)
+    print("0 笔：区分「文件没数据」和「规则没认出来」")
+    print("=" * 78)
+
+    # B：有金额没日期（8 位紧凑写法，日期 token 认不出来）
+    compact = [["20260903", "POS消费", "商户_TEST", "-38.50", "1234.56"],
+               ["20260904", "ATM取现", "商户_TEST", "-200.00", "1034.56"]]
+    res_b = _parse_bank_rows_auto(compact, "x.pdf", source="bank_pdf")
+    check("B: 解析 0 笔", len(res_b.txns), 0)
+    check("B: 两行都记进了 skipped（不再是静默丢弃）", len(res_b.skipped), 2)
+    check("B: 原因码是 no_date",
+          sorted({s["reason_code"] for s in res_b.skipped}), ["no_date"])
+    check("B: sample 是骨架不是原文",
+          res_b.skipped[0]["sample"],
+          "99999999 | aaa字字 | 字字_aaaa | -99.99 | 9999.99")
+    check("B: sample 里没有标记串", scan_for_markers(str(res_b.skipped)), [])
+
+    # A：只有表头，没有流水行
+    res_a = _parse_bank_rows_auto([["交易日期", "交易摘要", "交易金额"]], "x.pdf",
+                                  source="bank_pdf")
+    check("A: 解析 0 笔", len(res_a.txns), 0)
+    check("A: skipped 也是空的（与 B 可区分）", len(res_a.skipped), 0)
+
+    # 报错文案必须把两者分开说
+    ledger = Ledger(sqlite3.connect(":memory:"), os.path.join(tmp, "ledger2.db.enc"))
+    lines: list[str] = []
+
+    class _R:
+        """假装成一个「有行但全认不出」的解析结果，走一遍 pipeline 的报错分支。"""
+        txns = []
+        declared_count = None
+        skipped = res_b.skipped
+        path = "账单.zip"
+        summary = lambda self: ""
+
+    orig = pipeline.PARSERS
+    pipeline.PARSERS = {"bank_pdf": lambda p, pw=None: _R()}
+    try:
+        outcome = pipeline.import_file(os.path.join(tmp, "账单.zip"), ledger,
+                                       source="bank_pdf", archive=False,
+                                       emit=lines.append)
+    finally:
+        pipeline.PARSERS = orig
+    printed_b = "\n".join(lines)
+    check("导入失败", outcome.ok, False)
+    check("B 的报错说「有行但没认出来」", "解析规则没认出来" in printed_b, True)
+    check("B 的报错指向了结构探针", "bank-pdf-probe" in printed_b, True)
+    check("B 的报错不含标记串", scan_for_markers(printed_b), [])
+
+    lines2: list[str] = []
+    class _R2(_R):
+        skipped = []
+    pipeline.PARSERS = {"bank_pdf": lambda p, pw=None: _R2()}
+    try:
+        pipeline.import_file(os.path.join(tmp, "账单2.zip"), ledger, source="bank_pdf",
+                             archive=False, emit=lines2.append)
+    finally:
+        pipeline.PARSERS = orig
+    printed_a = "\n".join(lines2)
+    check("A 的报错说「连一行流水都没有」", "连一行像流水的行都没有" in printed_a, True)
+    check("A 的报错建议重新导出", "重新导出" in printed_a, True)
+    check("A 与 B 的报错文案不同", printed_a != printed_b, True)
 
     print()
     print("=" * 78)

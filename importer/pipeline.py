@@ -7,11 +7,12 @@ cli 的 `import` 和 monthly 的批处理都走这一份逻辑。
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .categorize import categorize
-from .model import describe_issue
+from .model import ISSUE_LABELS, describe_issue
 from .render import money
 from .sources import PARSERS, detect_source
 from .store import Ledger
@@ -168,6 +169,29 @@ def import_file(
         if result.declared_count:
             msg += f"，但文件自称有 {result.declared_count} 笔记录"
         emit(f"导入中止：{msg}。没有任何数据被写入。")
+
+        # 「0 笔」有两种完全不同的原因，处置方式相反，不能报得一模一样：
+        #   A. 文件真的没有流水行（残缺导出、空文件）
+        #   B. 文件里有行，但解析器一个字段都没认出来（规则不匹配这份排版）
+        # 靠 skipped 区分：A 是空的，B 一定有记录。
+        if result.skipped:
+            by_code: dict[str, int] = {}
+            for item in result.skipped:
+                code = item.get("reason_code", "?")
+                by_code[code] = by_code.get(code, 0) + 1
+            emit(f"  原因：认出了 {len(result.skipped)} 行，但每一行都缺关键字段"
+                 f"（文件里**有**流水行，是解析规则没认出来）。")
+            for code, n in sorted(by_code.items(), key=lambda x: -x[1]):
+                emit(f"    {ISSUE_LABELS.get(code, code)}：{n} 行")
+            emit("  下一步：把这份文件的结构打出来（输出全脱敏，可安全外发）——")
+            emit(f"    <venv>\\Scripts\\python.exe scripts\\bank-pdf-probe.py "
+                 f"\"{os.path.basename(result.path)}\"")
+            emit("  照着骨架调解析规则即可；文件本身没坏。")
+        else:
+            emit("  原因：这个文件里连一行像流水的行都没有。")
+            emit("  多半是导出残缺（只有说明和表头）或者文件本身是空的。")
+            emit("  重新导出一次通常能解决。")
+
         for item in result.skipped[:5]:
             emit(f"  {describe_issue(item)}")
         outcome.status = "parse_failed"

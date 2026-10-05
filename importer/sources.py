@@ -322,6 +322,34 @@ _INCOME_WORDS = ("收入", "转入", "存入", "入账", "退款", "贷")
 _EXPENSE_WORDS = ("支出", "转出", "消费", "付款", "扣款", "借")
 
 
+def _skeleton(text: str) -> str:
+    r"""把一格文本压成「骨架」：只保留形状，不保留值。
+
+    数字→9、中文→字、字母→a、空格保留、标点原样。
+    「20260903 POS消费 -38.50」→ 「99999999 aaa字字 -99.99」
+
+    **为什么失败记录里不能放原文。** 月度批处理的后台执行器会把标准输出
+    整段追加进 `vault\logs\monthly-YYYYMM.log`（那是「自动化场景下只有日志
+    可查」的必然结果）。失败记录里一旦带上原文，一笔解析失败就把商户名、
+    金额、单号抄进了一个长期文本文件 —— 而 `raw` 字段本来就是为此被换掉的。
+
+    所以诊断信息只能是形状：用户要判断「日期写法认不认得出来」，
+    看到 `99999999` 就够了，不需要知道是 9 月 3 号还是别的日子。
+    同一原则见 `render.mask_merchant` 与 `scripts\bank-pdf-probe.py`。
+    """
+    out = []
+    for ch in text:
+        if ch.isdigit():
+            out.append("9")
+        elif ch.isascii() and ch.isalpha():
+            out.append("a")
+        elif _RE_HAS_CJK.match(ch):
+            out.append("字")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _extract_amounts(text: str) -> list:
     """从一段文本里抠出所有金额 token，返回 [(符号, 数字串)]。"""
     out = []
@@ -374,11 +402,34 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
                 amounts.append((sign, digits))
 
         if not dates:
+            # 这一行连日期都没有 —— 可能是表头、合计、空行，也可能
+            # **日期的写法没被认出来**（比如「20260903」这种 8 位紧凑写法）。
+            #
+            # 以前这里是光秃秃一句 continue：行被丢掉，skipped 里也不记，
+            # 于是整份账单解析成 0 笔时，日志只显示
+            #   「解析成功 0 笔 / 跳过 0 行」
+            # 用户完全看不出发生了什么 —— 那 0 笔是文件真的没数据，
+            # 还是解析器一个日期都没认出来。**这两种情况的处置完全不同**
+            # （前者是文件坏了，后者是解析规则要改），不该报得一模一样。
+            #
+            # 现在：无日期但有金额的（有交易特征）记进 skipped，
+            # 无日期又无金额的（表头/合计/说明行）不记，那是正常内容。
+            # 这样「跳过 N 行」里的 N 才有诊断价值。
+            if amounts:
+                skipped.append({
+                    "row": row_no, "reason_code": "no_date", "field": "ts",
+                    "reason": "这一行有金额但没找到日期，丢弃（日期写法可能没被认出来）",
+                    # 只放骨架，不放原文。理由见 _skeleton 的 docstring。
+                    "sample": " | ".join(_skeleton(c) for c in cells)[:120],
+                })
             continue
+
         if not amounts:
             if any(_RE_HAS_CJK.search(c) for c in cells):
                 skipped.append({"row": row_no, "reason_code": "invalid_amount",
-                                "field": "amount"})
+                                "field": "amount",
+                                "reason": "这一行有日期但没找到带两位小数的金额",
+                                "sample": " | ".join(_skeleton(c) for c in cells)[:120]})
             continue
 
         for cell in cells:

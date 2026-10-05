@@ -16,8 +16,11 @@
 用法：
     <venv>\\Scripts\\python.exe scripts\\bank-pdf-probe.py "账单.pdf"
     <venv>\\Scripts\\python.exe scripts\\bank-pdf-probe.py "账单.pdf" --rows 40
+    <venv>\\Scripts\\python.exe scripts\\bank-pdf-probe.py "账单.zip"   ← zip 也行
 
 密码在运行时提示输入，不回显、不保存、不落盘。
+（zip 的密码与里面那份 PDF 若是同一套，一次输入就够；
+  7-Zip 不读 stdin，所以密码会出现在命令行里 —— 单机自用可接受。）
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from importer.bank_pdf import PdfError, extract_rows  # noqa: E402
+from importer.archive import ArchiveError  # noqa: E402
 
 CJK_RANGE = ("\u4e00", "\u9fff")
 
@@ -53,22 +57,34 @@ def mask(text: str) -> str:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="银行 PDF 结构探针（输出全部脱敏）")
-    ap.add_argument("pdf", help="PDF 路径")
+    ap.add_argument("pdf", help="PDF 路径（也可以直接给装着它的 zip）")
     ap.add_argument("--rows", type=int, default=30, help="最多显示多少行（默认 30）")
     ap.add_argument("--password", default=None,
                     help="密码。不传则交互提示（推荐：交互输入不会留在命令历史里）")
     args = ap.parse_args()
 
+    if not os.path.isfile(args.pdf):
+        print(f"找不到文件：{args.pdf}")
+        return 2
+
     password = args.password
     if password is None:
         try:
-            password = getpass.getpass("PDF 密码（不回显，不保存）：")
+            hint = ""
+            if args.pdf.lower().endswith(".zip"):
+                hint = "（zip 的密码；里面那份 PDF 若同密码，此处一次就够）"
+            password = getpass.getpass(f"密码（不回显，不保存）{hint}：")
         except (KeyboardInterrupt, EOFError):
             print("\n已取消。")
             return 2
 
     try:
         rows, meta = extract_rows(args.pdf, password)
+    except ArchiveError as exc:
+        # zip 解不开就说 zip 的事，别包装成「读不了这个 PDF」——
+        # 那会把「zip 解不开」误报成「PDF 有问题」，方向全错。
+        print(f"读不了这个压缩包：{exc}")
+        return 2
     except PdfError as exc:
         print(f"读不了这个 PDF：{exc}")
         return 2
