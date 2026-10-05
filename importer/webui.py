@@ -1177,7 +1177,8 @@ async function loadDetail() {
     if (d.truncated) {
       h += "<div class='warn'>本月超过 1000 笔，只显示最近 1000 笔。</div>";
     }
-    box.innerHTML = h + "</div>" + detailList();
+    box.innerHTML = h + "</div>" +
+      "<div id='detail-list'>" + detailList() + "</div>";
     const ms = document.getElementById("d-month");
     if (ms) ms.onchange = e => { curMonth = e.target.value; detailOpen = {}; loadDetail(); };
   } catch (e) {
@@ -1224,7 +1225,7 @@ function detailList() {
     const open = !!detailOpen[cat];
     const shown = open ? list : list.slice(0, 1);
     h += "<div class='card'>" +
-         "<div class='dcat' onclick='detailToggle(\"" + esc(cat).replace(/"/g, "&quot;") + "\')'>" +
+         "<div class='dcat' data-cat='" + esc(cat) + "'>" +
            "<span class='caret'>" + (open ? "▾" : "▸") + "</span>" +
            "<b>" + esc(cat) + "</b>" +
            "<span class='muted'>" + list.length + " 笔" +
@@ -1243,10 +1244,14 @@ function detailList() {
            "<td class='muted'>" + esc(t.source) + "</td></tr>";
     });
     h += "</tbody></table>";
-    if (list.length > shown.length) {
-      h += "<div class='more'><button class='act' onclick='detailToggle(\"" +
-           esc(cat).replace(/"/g, "&quot;") + "\')'>展开其余 " +
-           (list.length - shown.length) + " 笔</button></div>";
+    /* 折叠时给「展开其余 N 笔」，展开后给「收起」——
+       少了「收起」用户会以为点完就没救了，只能刷新页面。 */
+    if (open && list.length > 1) {
+      h += "<div class='more'><button class='act ghost' data-cat='" + esc(cat) +
+           "'>收起</button></div>";
+    } else if (list.length > shown.length) {
+      h += "<div class='more'><button class='act' data-cat='" + esc(cat) +
+           "'>展开其余 " + (list.length - shown.length) + " 笔</button></div>";
     }
     h += "</div>";
   });
@@ -1257,19 +1262,28 @@ function detailList() {
 }
 function detailToggle(cat) {
   detailOpen[cat] = !detailOpen[cat];
-  const box = document.getElementById("detail-body");
-  if (box && DETAIL) {
-    /* 只重画列表部分，保留上面的月份/搜索框，
-       否则用户输了一半的搜索词会被清掉。 */
-    const pos = box.innerHTML.indexOf("</div><div class='card'");
-    if (pos > 0) {
-      const keep = box.innerHTML.slice(0, pos + 6);
-      box.innerHTML = keep + detailList();
-    } else {
-      box.innerHTML = detailList();
-    }
-  }
+  const listBox = document.getElementById("detail-list");
+  if (!listBox || !DETAIL) return;
+  /* 只重画列表那一个节点。
+     上一版靠 `innerHTML.indexOf("</div><div class='card'")` 找分割点 ——
+     而我生成的 HTML 用的是**双引号**，那个单引号串永远匹配不上，
+     于是走 else 分支把整个容器清空，表现为「点了没反应」。
+     用 DOM 节点就没有这种字符串匹配的坑。 */
+  listBox.innerHTML = detailList();
 }
+
+/* 分类标题和「展开其余」按钮共用 data-cat，点哪儿都走同一个处理。
+   用**事件委托**而不是 onclick 拼字符串：
+     · onclick='detailToggle("' + cat + '")' 在分类名含引号/反斜杠时会拼出坏 JS
+     · 而且字符串匹配式的重绘（上一版按 innerHTML 找分割点）一改格式就失效
+   委托到 #detail-list 上，只绑一次，重画 innerHTML 后也不用重绑。 */
+document.addEventListener("click", e => {
+  const t = e.target.closest("[data-cat]");
+  if (!t) return;
+  /* 只处理明细页里的，别把别的带 data-cat 的元素也吃进来 */
+  if (!document.getElementById("detail-list")) return;
+  detailToggle(t.getAttribute("data-cat"));
+});
 
 /* ---------------- 未分类 ---------------- */
 function renderUnmatched() {
