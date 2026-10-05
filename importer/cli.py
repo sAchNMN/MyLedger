@@ -36,11 +36,20 @@ from . import (
     review_ui,
     secure_store,
     sourcehint,
+    suggest,
     webui,
 )
-from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
+from .categorize import (
+    CATEGORIES,
+    DEFAULT_AI_MODEL,
+    DEFAULT_AI_URL,
+    clear_manual,
+    manual_map,
+    set_manual,
+)
 from .model import SOURCE_LABELS, STATUS_KILLS_EXPENSE, status_verdict
 from .pipeline import import_file
+from .power import require_ac
 from .render import mask_merchant, money, print_month, print_overview, table
 
 DEFAULT_VAULT = os.path.join(os.path.expanduser("~"), "MyLedgerVault")
@@ -700,6 +709,110 @@ def cmd_sources(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# suggest（建议分类，人来拍板）
+# --------------------------------------------------------------------------
+
+def cmd_suggest(args) -> int:
+    """给未分类商户一个建议，由你逐条拍板。
+
+    这不是自动分类。建议只是把「库里已经有的信息」搬到你眼前，
+    决定权在你手上 —— 少的是打字次数，不是判断次数。
+    """
+    vault = _vault(args)
+    use_ai = bool(args.ai)
+
+    if use_ai and not require_ac("本地 AI 建议分类", override=args.ignore_power):
+        return 1
+
+    with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+        items = suggest.with_ai(ledger, use_ai=use_ai,
+                                ai_url=args.ai_url, ai_model=args.ai_model)
+
+    if not items:
+        print("没有未分类的交易，规则覆盖得不错。")
+        return 0
+
+    total = sum(i.expense + i.income for i in items)
+    print("=" * 70)
+    print(f"未分类商户 {len(items)} 个，涉及 {money(total)}")
+    print("=" * 70)
+
+    if args.list:
+        for index, item in enumerate(items, 1):
+            tag = f"{item.category}（{item.evidence}）" if item.category else "没有建议"
+            print(f"{index:>3}. {item.merchant:<24} {item.count:>3} 笔  {tag}")
+            if item.sample_item:
+                print(f"      商品：{item.sample_item}")
+        print()
+        print("逐条拍板：python -m importer suggest")
+        return 0
+
+    print()
+    print("可用分类（输入编号即可）：")
+    for index, name in enumerate(CATEGORIES, 1):
+        print(f"  {index:>2}. {name}", end="\n" if index % 6 == 0 else "")
+    print()
+    print("  回车 = 采纳建议   编号 = 换成这个分类   s = 跳过   q = 退出")
+    print()
+
+    accepted: list[tuple[str, str]] = []
+    for index, item in enumerate(items, 1):
+        amount = money(item.expense or item.income)
+        print(f"[{index}/{len(items)}] {item.merchant}  {item.count} 笔  {amount}")
+        if item.sample_item:
+            print(f"      商品：{item.sample_item}")
+        if item.category:
+            print(f"      建议：{item.category}  ← {item.evidence}")
+        else:
+            print("      没有建议（想不出依据就不猜）")
+        try:
+            answer = input("      你的决定 > ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n（中断了，已采纳的会写下去）")
+            break
+
+        if answer.lower() in ("q", "quit", "exit"):
+            break
+        if answer.lower() in ("s", "", "skip") and not item.category:
+            continue
+        if answer == "":
+            accepted.append((item.merchant, item.category))     # 采纳建议
+            continue
+        if answer.lower() in ("s", "skip"):
+            continue
+        try:
+            chosen = CATEGORIES[int(answer) - 1]
+        except (ValueError, IndexError):
+            print("      看不懂这个输入，跳过。")
+            continue
+        accepted.append((item.merchant, chosen))
+
+    if not accepted:
+        print()
+        print("一条都没采纳，账本没动。")
+        return 0
+
+    if not args.apply:
+        print()
+        print(f"试算：将采纳 {len(accepted)} 条（加 --apply 才真的写库）")
+        for merchant, category in accepted:
+            print(f"  {category:<8} {merchant}")
+        return 0
+
+    enc = secure_store.encrypted_path(vault)
+    if os.path.exists(enc):
+        fixups.backup(enc)
+    with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+        for merchant, category in accepted:
+            set_manual(ledger, merchant, category)
+            fixups.apply_manual(ledger, merchant, category, apply=True)
+    print()
+    print(f"已记下 {len(accepted)} 条，并回填到历史交易。")
+    print("撤销某一条：python -m importer setcat \"商户名\" --clear --apply")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # ocr
 # --------------------------------------------------------------------------
 
@@ -933,6 +1046,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # ---- sources ----
     sub.add_parser("sources", help="各渠道怎么导出账单").set_defaults(func=cmd_sources)
+
+    # ---- suggest ----
+    p = _add_vault(sub.add_parser(
+        "suggest",
+        help="给未分类商户一个建议分类，你逐条拍板（不是自动分类）"))
+    p.add_argument("--list", action="store_true", help="只列出建议，不进入逐条确认")
+    p.add_argument("--apply", action="store_true", help="真的写库（默认只试算）")
+    p.add_argument("--ai", action="store_true",
+                   help="本地没找到依据时用本机模型补一个建议（需装 Ollama）")
+    p.add_argument("--ai-url", default=DEFAULT_AI_URL, help="本地模型地址")
+    p.add_argument("--ai-model", default=DEFAULT_AI_MODEL, help="本地模型名")
+    p.add_argument("--ignore-power", action="store_true",
+                   help="忽略电源闸门（未插电也跑 AI）")
+    p.set_defaults(func=cmd_suggest)
 
     # ---- ocr ----
     p = sub.add_parser("ocr", help="银行截图 → TSV（调本地 Windows OCR）")
