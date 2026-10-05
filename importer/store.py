@@ -613,6 +613,71 @@ class Ledger:
         ).fetchall()
         return {"month": month, "rows": rows}
 
+    def month_transactions(self, month: str, category: Optional[str] = None,
+                          direction: Optional[str] = None,
+                          merchant: Optional[str] = None,
+                          limit: int = 500) -> list:
+        """按月查交易明细（给网页「点开看具体是哪几笔」用）。
+
+        为什么要有这个：`month_summary` 只给「分类 → 金额 → 笔数」的汇总，
+        看不到**具体是哪几笔**。汇总数字对不上时，唯一能查的办法是看明细。
+
+        **刻意排除 `confirmed_dup`**（与 `month_summary` 一致）：
+        那是用户已确认的重复，不该出现在明细里，否则笔数会多。
+
+        参数都可选，逐个收窄。`limit` 默认 500 —— 一个月真正常也有几百笔，
+        但不该一次拉全部（网页会卡）。
+
+        只 SELECT 白名单里的列，**不返回 raw / txn_id / 对方账号** ——
+        明细是要显示在网页上的，raw 里有形状摘要、账号可能有 19 位，
+        那属于账单原文，不该出现在界面上。
+        """
+        sql = [
+            "SELECT ts, source, direction, amount, counterparty, item,",
+            "       category, method, status, review",
+            "FROM txn WHERE substr(ts,1,7) = ? AND review != 'confirmed_dup'",
+        ]
+        args: list = [month]
+        if category:
+            sql.append("AND category = ?")
+            args.append(category)
+        if direction:
+            sql.append("AND direction = ?")
+            args.append(direction)
+        if merchant:
+            sql.append("AND counterparty = ?")
+            args.append(merchant)
+        sql.append("ORDER BY ts DESC, id DESC LIMIT ?")
+        args.append(int(limit))
+        return self.conn.execute(" ".join(sql), args).fetchall()
+
+    def month_detail(self, month: str) -> dict:
+        """一次拿全：汇总 + 明细（报表页用，省一次往返）。
+
+        明细按分类分组返回，界面上点开某一行就能直接显示 —— 不用再发请求。
+        """
+        summary = self.month_summary(month)
+        rows = self.month_transactions(month, limit=1000)
+
+        by_cat: dict = {}
+        for r in rows:
+            by_cat.setdefault(r["category"] or "未分类", []).append({
+                "ts": r["ts"],
+                "source": r["source"],
+                "direction": r["direction"],
+                "amount": f"{float(r['amount'] or 0):.2f}",
+                "counterparty": r["counterparty"] or "",
+                "item": r["item"] or "",
+                "method": r["method"] or "",
+                "review": r["review"] or "",
+            })
+        return {
+            "month": month,
+            "summary": [dict(r) for r in summary["rows"]],
+            "by_category": by_cat,
+            "truncated": len(rows) >= 1000,
+        }
+
     def overall(self) -> dict:
         row = self.conn.execute(
             "SELECT COUNT(*) AS n,"

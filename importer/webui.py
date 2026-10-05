@@ -385,6 +385,59 @@ def report_data(vault: str, month: str) -> dict:
     }
 
 
+def detail_data(vault: str, month: str = "") -> dict:
+    """交易明细（网页「账单明细」页的数据源）。
+
+    为什么要它
+    ----------
+    报表页 (`report_data`) 只给「分类 → 金额 → 笔数」的**汇总**。
+    汇总数字对不上时，唯一能查的办法是看**具体是哪几笔** ——
+    而以前整个网页没有这个能力，只能开命令行。
+
+    刻意不做「注册登录」
+    --------------------
+    用户提过要不要加账号系统。**单人本地软件加登录没有意义**：
+    登录进去看到的还是他一个人的数据，而账本密文是 DPAPI 绑 Windows 账号的
+    （换个 Windows 账号根本解不开，见 `secure_store`）。
+    真正需要权限的是「多个人共用一台机器」，那场景本地账本不适用。
+    如果以后真要做 Web 版多用户，那是另一个量级的改动，得先想清楚
+    「密钥存在哪、谁能解」——不是加个登录框就行的。
+
+    汇总口径与 `report_data` 完全一致（都排除 `confirmed_dup`），
+    否则点开看到的笔数会和上面的汇总对不上，那比看不到更让人困惑。
+    """
+    with secure_store.open_encrypted(vault, save_on_exit=False,
+                                     warn=lambda s: None) as ledger:
+        if month:
+            months = [month]
+        else:
+            # 不给月份时列出**全部有数据的月份**，让页面能切换
+            rows = ledger.conn.execute(
+                "SELECT DISTINCT substr(ts,1,7) AS m FROM txn "
+                "WHERE review != 'confirmed_dup' AND ts != '' "
+                "ORDER BY m DESC").fetchall()
+            months = [r["m"] for r in rows]
+
+        if not months:
+            return {"month": "", "months": [], "by_category": {},
+                    "truncated": False, "n": 0, "expense_total": "0.00"}
+
+        cur = month or months[0]
+        detail = ledger.month_detail(cur)
+        items = [t for group in detail["by_category"].values() for t in group]
+        expense_total = sum(float(t["amount"]) for t in items
+                            if t["direction"] == "expense")
+
+    return {
+        "month": cur,
+        "months": months,
+        "by_category": detail["by_category"],
+        "truncated": detail["truncated"],
+        "n": len(items),
+        "expense_total": f"{expense_total:.2f}",
+    }
+
+
 def review_data(vault: str) -> dict:
     """待确认的疑似重复，整理成界面需要的两条并排结构。"""
     with secure_store.open_encrypted(vault, save_on_exit=False, warn=lambda s: None) as ledger:
@@ -611,6 +664,15 @@ PAGE = r"""<!DOCTYPE html>
           padding:11px 14px; font-size:13px; margin-bottom:12px; }
   code { background:var(--bg); border:1px solid var(--line); border-radius:5px;
          padding:1px 5px; font-size:12px; }
+  /* 明细页 */
+  .dcat { display:flex; align-items:center; gap:9px; cursor:pointer;
+          padding:4px 0 10px; user-select:none; }
+  .dcat:hover b { color:var(--blue); }
+  .caret { color:var(--muted); width:12px; font-size:11px; }
+  .dcat .muted { margin-left:auto; font-size:12px; }
+  .more { margin-top:10px; }
+  td.bad { color:#b3402f; }
+  td.good { color:#1c7a4a; }
   pre.log { background:#1f1f1d; color:#e8e8e4; border-radius:10px; padding:14px;
             font-size:12px; line-height:1.55; max-height:320px; overflow:auto;
             white-space:pre-wrap; word-break:break-all; margin:0; }
@@ -648,6 +710,7 @@ PAGE = r"""<!DOCTYPE html>
   <button data-tab="import">导入<span class="badge" id="b-inbox" style="display:none">0</span></button>
   <button data-tab="review">疑似重复<span class="badge" id="b-review" style="display:none">0</span></button>
   <button data-tab="report">报表</button>
+  <button data-tab="detail">明细</button>
   <button data-tab="unmatched">未分类</button>
   <button data-tab="classify">分类诊断</button>
   <button data-tab="fix">历史修正</button>
@@ -658,6 +721,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="tab" id="tab-import"></div>
   <div class="tab" id="tab-review"></div>
   <div class="tab" id="tab-report"></div>
+  <div class="tab" id="tab-detail"></div>
   <div class="tab" id="tab-unmatched"></div>
   <div class="tab" id="tab-classify"></div>
   <div class="tab" id="tab-fix"></div>
@@ -707,6 +771,7 @@ function show(tab) {
   if (tab === "import") renderImport();
   if (tab === "review") renderReview();
   if (tab === "report") renderReport();
+  if (tab === "detail") renderDetail();
   if (tab === "unmatched") renderUnmatched();
   if (tab === "classify") renderClassify();
   if (tab === "fix") renderFix();
@@ -1045,6 +1110,167 @@ async function loadReport() {
   }
 }
 
+/* ---------------- 明细（点开看具体是哪几笔） ---------------- */
+let DETAIL = null;
+let detailOpen = {};          // 分类 -> true/false，记住哪些展开了
+let detailFilter = "";        // 搜索词
+let detailDir = "";           // 方向筛选
+
+/* 方向的显示名与配色。三个方向的名字要跟「报表」页一致，
+   否则用户会以为是两套口径。 */
+const DIR_LABEL = {
+  expense: "支出", income: "收入", neutral: "中性",
+};
+function dirClass(d) {
+  return d === "expense" ? "bad" : (d === "income" ? "good" : "muted");
+}
+function shortTime(ts) {
+  /* 库里存的是 "2026-09-30 18:56:58"，明细里只关心「哪天几点」，
+     完整秒数留着占地方。 */
+  return (ts || "").slice(5, 16);
+}
+function renderDetail() {
+  const el = document.getElementById("tab-detail");
+  if (el.dataset.ready !== "1") {
+    el.innerHTML =
+      "<div class='note'>报表只给「分类 → 金额 → 笔数」的汇总，" +
+      "数字对不上时得看具体是哪几笔 —— 这里就是那份明细。" +
+      "按分类点开，可搜商户/摘要。<br>" +
+      "已确认的重复<b>不在这里出现</b>（口径与报表页一致）。</div>" +
+      "<div id='detail-body'><div class='card'><div class='muted'>正在加载…</div></div></div>";
+    el.dataset.ready = "1";
+  }
+  loadDetail();
+}
+async function loadDetail() {
+  const box = document.getElementById("detail-body");
+  if (!box) return;
+  try {
+    const m = curMonth ? ("?month=" + encodeURIComponent(curMonth)) : "";
+    const d = await api("/api/detail" + m);
+    DETAIL = d;
+    let h = "<div class='card'>";
+    /* 月份切换。用库里真实有的月份，不用「当前月」——
+       导入历史账单时当前月可能是空的。 */
+    if ((d.months || []).length > 1) {
+      h += "<div class='row'><span class='muted'>月份</span><select id='d-month'>";
+      d.months.forEach(mm => {
+        h += "<option value='" + esc(mm) + "'" + (mm === d.month ? " selected" : "") +
+             ">" + esc(mm) + "</option>";
+      });
+      h += "</select></div>";
+    }
+    h += "<div class='row'><input id='d-q' placeholder='搜商户 / 摘要 / 备注' value='" +
+         esc(detailFilter) + "'><select id='d-dir'>" +
+         "<option value=''>全部方向</option>" +
+         ["expense", "income", "neutral"].map(k =>
+           "<option value='" + k + "'" + (detailDir === k ? " selected" : "") +
+           ">" + DIR_LABEL[k] + "</option>").join("") +
+         "</select>" +
+         "<button class='act' onclick='detailGo()'>筛选</button>" +
+         "<button class='act' onclick='detailClear()'>清空</button></div>";
+    h += "<div class='grid' style='margin:12px 0'>" +
+         kpi(d.n + " 笔", "本月交易总数") +
+         kpi(esc(d.expense_total) + " 元", "其中支出") +
+         kpi(String(Object.keys(d.by_category || {}).length), "涉及分类数") +
+         "</div>";
+    if (d.truncated) {
+      h += "<div class='warn'>本月超过 1000 笔，只显示最近 1000 笔。</div>";
+    }
+    box.innerHTML = h + "</div>" + detailList();
+    const ms = document.getElementById("d-month");
+    if (ms) ms.onchange = e => { curMonth = e.target.value; detailOpen = {}; loadDetail(); };
+  } catch (e) {
+    box.innerHTML = "<div class='card'><div class='warn'>" + esc(e.message) + "</div></div>";
+  }
+}
+function detailGo() {
+  const q = document.getElementById("d-q");
+  const dd = document.getElementById("d-dir");
+  detailFilter = q ? q.value.trim() : "";
+  detailDir = dd ? dd.value : "";
+  loadDetail();
+}
+function detailClear() {
+  detailFilter = ""; detailDir = ""; detailOpen = {};
+  loadDetail();
+}
+/* 把明细按分类列成可展开的表。 */
+function detailList() {
+  if (!DETAIL) return "";
+  const q = detailFilter.toLowerCase();
+  const groups = Object.entries(DETAIL.by_category || {});
+  if (!groups.length) {
+    return "<div class='card'><p class='muted'>这个月还没有交易。</p></div>";
+  }
+  /* 分类按该分类的支出总额降序 —— 与报表页口径一致，
+     免得同一份数据在两个页面里顺序不同。 */
+  const sorted = groups.map(([cat, items]) => {
+    const exp = items.filter(t => t.direction === "expense")
+                     .reduce((a, t) => a + Number(t.amount), 0);
+    return [cat, items, exp];
+  }).sort((a, b) => b[2] - a[2]);
+
+  let h = "";
+  sorted.forEach(([cat, items, exp]) => {
+    let list = items;
+    if (detailDir) list = list.filter(t => t.direction === detailDir);
+    if (q) {
+      list = list.filter(t =>
+        ((t.counterparty || "") + " " + (t.item || "")).toLowerCase().includes(q));
+    }
+    /* 筛选后该分类一笔都不剩就别显示了 —— 显示一个空分类只会让人以为筛选出错 */
+    if (!list.length) return;
+    const open = !!detailOpen[cat];
+    const shown = open ? list : list.slice(0, 1);
+    h += "<div class='card'>" +
+         "<div class='dcat' onclick='detailToggle(\"" + esc(cat).replace(/"/g, "&quot;") + "\')'>" +
+           "<span class='caret'>" + (open ? "▾" : "▸") + "</span>" +
+           "<b>" + esc(cat) + "</b>" +
+           "<span class='muted'>" + list.length + " 笔" +
+             (exp > 0 ? " · 支出 " + exp.toFixed(2) + " 元" : "") + "</span>" +
+         "</div>";
+    h += "<table><thead><tr><th>时间</th><th>方向</th><th class='num'>金额(元)</th>" +
+         "<th>商户 / 对方</th><th>摘要</th><th>来源</th></tr></thead><tbody>";
+    shown.forEach(t => {
+      /* 中性交易默认折叠时只给一行 —— 它们大多是转存/提现，
+         逐条列出来会把真正想看的支出淹没。 */
+      h += "<tr><td class='muted'>" + esc(shortTime(t.ts)) + "</td>" +
+           "<td class='" + dirClass(t.direction) + "'>" + (DIR_LABEL[t.direction] || "") + "</td>" +
+           "<td class='num'>" + esc(t.amount) + "</td>" +
+           "<td>" + esc(t.counterparty || "—") + "</td>" +
+           "<td class='muted'>" + esc(t.item || "") + "</td>" +
+           "<td class='muted'>" + esc(t.source) + "</td></tr>";
+    });
+    h += "</tbody></table>";
+    if (list.length > shown.length) {
+      h += "<div class='more'><button class='act' onclick='detailToggle(\"" +
+           esc(cat).replace(/"/g, "&quot;") + "\')'>展开其余 " +
+           (list.length - shown.length) + " 笔</button></div>";
+    }
+    h += "</div>";
+  });
+  if (!h) {
+    h = "<div class='card'><p class='muted'>没有符合筛选条件的交易。</p></div>";
+  }
+  return h;
+}
+function detailToggle(cat) {
+  detailOpen[cat] = !detailOpen[cat];
+  const box = document.getElementById("detail-body");
+  if (box && DETAIL) {
+    /* 只重画列表部分，保留上面的月份/搜索框，
+       否则用户输了一半的搜索词会被清掉。 */
+    const pos = box.innerHTML.indexOf("</div><div class='card'");
+    if (pos > 0) {
+      const keep = box.innerHTML.slice(0, pos + 6);
+      box.innerHTML = keep + detailList();
+    } else {
+      box.innerHTML = detailList();
+    }
+  }
+}
+
 /* ---------------- 未分类 ---------------- */
 function renderUnmatched() {
   const el = document.getElementById("tab-unmatched");
@@ -1355,6 +1581,20 @@ async function refreshState() {
   await loadReview();
   if (STATE && STATE.review_left) show("review");
 })();
+
+/* 让 URL 能直接打开某个页签：`/?t=令牌#detail`
+   用途有两个：
+     1. 可以把「明细」「未分类」这类常看的页面**收藏成书签**
+     2. 排查问题时能把某个页面的确切状态发给别人看
+   认不出的页签一律回「概览」，不能白屏。 */
+(function () {
+  const want = (location.hash || "").replace(/^#/, "");
+  const known = ["home", "import", "review", "report", "detail",
+                 "unmatched", "classify", "fix", "help"];
+  if (want && known.indexOf(want) >= 0 && !(STATE && STATE.review_left)) {
+    show(want);
+  }
+})();
 </script>
 </body>
 </html>
@@ -1563,6 +1803,16 @@ def build_server(vault: str, *, port: int = DEFAULT_PORT, host: str = "127.0.0.1
                                              fallback={"month": month, "expense": [],
                                                        "expense_total": "0.00", "expense_n": 0,
                                                        "income": "0.00", "neutral": "0.00"}))
+                    return
+                if path == "/api/detail":
+                    # 报表「点开看具体是哪几笔」用。汇总数字对不上时，
+                    # 唯一能查的办法就是看明细 —— 以前这个页面做不到。
+                    month = query.get("month", [""])[0]
+                    self._json(console.quick(
+                        lambda: detail_data(vault, month),
+                        fallback={"month": month, "by_category": {},
+                                  "months": [], "truncated": False,
+                                  "n": 0, "expense_total": "0.00"}))
                     return
                 if path == "/api/unmatched":
                     mask = query.get("mask", ["0"])[0] == "1"
