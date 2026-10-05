@@ -235,6 +235,68 @@ def case_move_to_done_retry():
     check("提示文件仍在原处", "文件仍在原处" in src, True)
 
 
+
+def _make_pdf_with_gaps(dest: str) -> str:
+    """造一份「有空单元格」的 PDF —— 复刻真实踩到的那种形态。
+
+    为什么必须造：真实那份账单的问题是**列对齐全塌了**
+    （PDF 里空单元格不占格，后面的列全部左移），而
+    `fixtures/sample_bank.pdf` 每行都满格，验不出这个问题。
+    """
+    import pymupdf
+    header = ["TXN_DATE", "TXN_TIME", "SUMMARY", "AMOUNT", "BALANCE",
+              "CP", "LOG", "CHANNEL", "MEMO", "A", "B"]
+    body = [
+        # 时间列为空 -> 少了 1 格
+        ["20260921", "", "INT", "+0.00", "0.04", "--", "", "PERIODIC", "", "x", "y"],
+        # 满格
+        ["20260928", "205056", "TRANSFER", "+2400.00", "2400.04",
+         "XX", "", "SUPERNET", "", "x", "y"],
+    ]
+    doc = pymupdf.open()
+    page = doc.new_page(width=842, height=595)
+    x = 40
+    for name in header:
+        page.insert_text((x, 100), name, fontsize=7)
+        x += 70
+    y = 120
+    for row in body:
+        x = 40
+        for value in row:
+            if value:
+                page.insert_text((x, y), value, fontsize=7)
+            x += 70
+        y += 18
+    doc.save(dest)
+    doc.close()
+    return dest
+
+
+def case_column_alignment():
+    print("\n[9] 空单元格必须补成空串，不能让后面的列左移（实测错值的根因）")
+    import tempfile
+    from importer.bank_pdf import extract_rows
+
+    tmp = tempfile.mkdtemp()
+    path = _make_pdf_with_gaps(os.path.join(tmp, "gaps.pdf"))
+    rows, _ = extract_rows(path)
+
+    widths = [len(r) for r in rows]
+    check("所有行格数一致（对齐成功）", len(set(widths)), 1)
+    check("格数等于表头列数", widths[0], 11)
+    # 关键两行：空的那格必须在原位
+    check("有空格那行：时间列是空串（不是摘要）", rows[1][1], "")
+    check("有空格那行：摘要还在第 2 列", rows[1][2], "INT")
+    check("有空格那行：金额还在第 3 列", rows[1][3], "+0.00")
+    check("满格那行：时间列是真实时间", rows[2][1], "205056")
+    check("满格那行：摘要是 TRANSFER", rows[2][2], "TRANSFER")
+    # 这两条是同一个下标在不同行装不同东西的对照
+    check("下标 1 在两行装的是不同的东西（正是原 bug）",
+          rows[1][1] != rows[2][1], True)
+    # 0 元那一行照样在（对齐不负责过滤，过滤是解析层的事）
+    check("0 元那行的金额没丢", rows[1][3], "+0.00")
+
+
 def main() -> int:
     print()
     print("=" * 78)
@@ -248,6 +310,7 @@ def main() -> int:
     case_columns_not_guessed()
     case_amount_not_balance()
     case_move_to_done_retry()
+    case_column_alignment()
 
     print()
     print("=" * 78)

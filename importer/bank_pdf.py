@@ -106,6 +106,8 @@ def _cluster_rows(words, row_tolerance: float = 0.6, gap_ratio: float = 0.8):
     for row in sorted(rows, key=lambda r: r["cy"]):
         seq = sorted(row["items"], key=lambda i: i["left"])
         cells, buf, prev_right = [], "", None
+        spans = []          # 每格的 [left, right]，给对齐用
+        span_start = None
         for item in seq:
             if prev_right is not None:
                 gap = item["left"] - prev_right
@@ -116,13 +118,70 @@ def _cluster_rows(words, row_tolerance: float = 0.6, gap_ratio: float = 0.8):
                 if gap > merge_threshold or gap < -merge_threshold:
                     if buf:
                         cells.append(buf)
+                        spans.append((span_start, prev_right))
                         buf = ""
+                    span_start = item["left"]
+            if not buf:
+                span_start = item["left"]
             buf += item["text"]
             prev_right = item["right"]
         if buf:
             cells.append(buf)
+            spans.append((span_start, prev_right))
         if cells:
-            out.append(cells)
+            # 每行带上坐标：后面 align_rows_to_columns 要靠它把各行对齐到同一组列。
+            # 不带坐标的话，**空单元格会让整行左移**——实测这份农行账单里
+            # 「结息」那两行没有交易时间，格子数比表头少，后面所有列都往前挪了一格，
+            # 于是 amount 认到的那一列在有时间的行上是金额、在没时间的行上是余额。
+            # 同一行里同样的下标装着不同的列，按下标取值必然出错，而且不报错。
+            out.append((cells, spans))
+    return out
+
+
+def align_rows_to_columns(rows, header_pos: int) -> list[list[str]]:
+    """把各行的格子按 x 坐标对齐到同一组列（用表头行当锚）。
+
+    为什么必须做（实测踩到）：
+        PDF 里空单元格**不占格**。一份 11 列的农行账单，
+        「结息」那两行没有交易时间，抽出来只有 7 格而不是 11 格，
+        后面的列全部左移 —— 于是同一个下标在不同行里装着不同的列：
+            [1] 在「结息」行是摘要（结息），在「转账」行是时间（205056）
+            [3] 在「结息」行是余额（0.04），在「转账」行是金额（-2400.00）
+        按下标取值必然出错，而且**不报错**（取到的都是像模像样的金额）。
+
+    做法：以表头每格的横向中点为列心，把每一行的格子归到最近的列心。
+    落在两列之间的（跨列的长文本）归到中点最近的那一列。
+    没有任何格子的列留空字符串 —— **空字符串正是这里要造出来的东西**，
+    它保证「所有行的下标含义一致」。
+
+    代价：列心很近时（比如两列只隔 2pt）可能归错。
+    那种排版本来就应该靠表头关键词区分，而 `build_index` 是按列名匹配的，
+    归错一格会立刻表现为「字段认到了别的列名」，测试能抓到。
+    """
+    if not rows or header_pos is None or header_pos >= len(rows):
+        return [r if isinstance(r, list) else r[0] for r in rows]
+
+    header_cells, header_spans = rows[header_pos]
+    if not header_spans:
+        return [r[0] if isinstance(r, tuple) else r for r in rows]
+
+    centers = [(a + b) / 2.0 for a, b in header_spans]
+    n_cols = len(centers)
+
+    out: list[list[str]] = []
+    for row in rows:
+        cells, spans = row if isinstance(row, tuple) else (row, [])
+        if not spans:
+            out.append(list(cells) + [""] * (n_cols - len(cells)))
+            continue
+        aligned = [""] * n_cols
+        for text, (left, right) in zip(cells, spans):
+            mid = (left + right) / 2.0
+            best = min(range(n_cols), key=lambda i: abs(centers[i] - mid))
+            # 同一列里已经有东西了，把新的接在后面（宁可挤在一格，
+            # 也别丢掉内容 —— 丢掉是静默的错，挤在一起至少还看得见）
+            aligned[best] = (aligned[best] + text) if aligned[best] else text
+        out.append(aligned)
     return out
 
 
@@ -189,19 +248,22 @@ def extract_rows(path: str, password: Optional[str] = None) -> tuple[list[list[s
             meta["authenticated"] = False
             raise PdfError("PDF 密码不对。")
 
-    rows: list[list[str]] = []
+    clustered: list = []          # [(cells, spans)]，每页一段
+    page_spans: list = []        # 每页的行数，用来定表头在哪一页
     try:
         for page in doc:
             try:
                 words = page.get_text("words")
             except Exception:
                 words = []
-            rows.extend(_cluster_rows(words))
+            one = _cluster_rows(words)
+            clustered.extend(one)
+            page_spans.append(len(one))
     finally:
         doc.close()
 
     # 一页都没有文字层 —— 这是扫描件，得走 OCR，不是 PDF 文本那条路
-    if not rows:
+    if not clustered:
         meta["text_layer"] = False
         raise PdfError(
             "这个 PDF 里抽不到任何文字，说明它是**扫描件**（图片，没有文字层）。\n"
@@ -209,4 +271,65 @@ def extract_rows(path: str, password: Optional[str] = None) -> tuple[list[list[s
             "  有文字层的 PDF（银行直接导出的账单通常是）不会有这个问题。"
         )
 
+    # 按表头对齐列（原因见 align_rows_to_columns 的注释）：
+    # PDF 里空单元格不占格，不对齐的话同一个下标在不同行里装着不同的列。
+    #
+    # **逐页做**：多页账单的表头只印在第一页，后面几页没有表头。
+    # 用第一页的列心去对齐后面几页是对的 —— 同一份 PDF 的排版是一致的。
+    rows: list[list[str]] = []
+    offset = 0
+    ref_centers = None
+    for n_in_page in page_spans:
+        chunk = clustered[offset:offset + n_in_page]
+        offset += n_in_page
+        if not chunk:
+            continue
+        head_pos = _pick_anchor(chunk)
+        if ref_centers is None and head_pos is not None:
+            rows.extend(align_rows_to_columns(chunk, head_pos))
+            ref_centers = True
+        elif ref_centers is not None:
+            rows.extend(align_rows_to_columns(chunk, head_pos))
+        else:
+            # 第一页没认出表头（有的 PDF 表头在第二页）
+            rows.extend(cells for cells, _ in chunk)
+
     return rows, meta
+
+
+def _find_header_index(chunk: list) -> int:
+    """这一页里哪一行是表头。找不到返回 None。"""
+    from .sniff import HEADER_ANCHORS
+
+    for i, item in enumerate(chunk[:12]):
+        cells, _ = item if isinstance(item, tuple) else (item, [])
+        filled = [c for c in cells if c.strip()]
+        if len(filled) < 5:
+            continue
+        joined = "".join(filled)
+        if sum(1 for a in HEADER_ANCHORS if a in joined) >= 2:
+            return i
+    return None
+
+
+def _pick_anchor(chunk: list) -> int:
+    """拿哪一行当「列锚」。
+
+    优先用表头行；表头认不出来（英文表头、无列名的流水）时，
+    **退而用格数最多的那一行**。理由：那通常就是数据最全的一行，
+    而列对齐要的就是一份「完整的列坐标」当基准。
+
+    为什么不一律用格数最多的行：表头行的列位置最权威
+    （表头是印在纸上的固定位置，而数据行可能因为某个格子超长而多切一格）。
+    两者都取不到时返回 None，调用方退回不聚类。
+    """
+    head = _find_header_index(chunk)
+    if head is not None:
+        return head
+    best, best_n = None, 0
+    for i, item in enumerate(chunk[:15]):
+        cells, _ = item if isinstance(item, tuple) else (item, [])
+        n = len([c for c in cells if c.strip()])
+        if n > best_n:
+            best, best_n = i, n
+    return best if best_n >= 4 else None
