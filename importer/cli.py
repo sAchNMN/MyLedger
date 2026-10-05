@@ -143,6 +143,76 @@ def cmd_monthly(args) -> int:
 # recompute —— 按当前规则修正历史数据（默认只试算）
 # --------------------------------------------------------------------------
 
+def cmd_batches(args) -> int:
+    """列出导入批次。查「哪一批是坏的」的入口。"""
+    vault = _vault(args)
+    with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+        rows = ledger.conn.execute(
+            "SELECT b.batch_id, b.source, b.imported_at, b.parsed, b.inserted, "
+            "       b.skipped, b.status, b.path, "
+            "       (SELECT COUNT(*) FROM txn t WHERE t.batch_id = b.batch_id) AS live "
+            "FROM batch b ORDER BY b.imported_at").fetchall()
+        if not rows:
+            print("还没有任何导入批次。")
+            return 0
+        print(f"共 {len(rows)} 个导入批次：")
+        print()
+        body = []
+        for r in rows:
+            body.append([
+                r["batch_id"],
+                r["imported_at"],
+                r["source"],
+                f"{r['inserted']}/{r['parsed']}",
+                r["live"],
+                os.path.basename(r["path"] or ""),
+            ])
+        print(table(
+            ["批次", "导入时间", "来源", "写入/解析", "库中", "文件"],
+            body,
+            ["left", "left", "left", "right", "right", "left"],
+        ))
+        print()
+        print("「写入/解析」两列不等 = 那一批有行没写进去（部分失败）。")
+        print("「库中」少于「写入」= 有交易被后来删过或标成重复。")
+        print("删掉一整批：python -m importer drop-batch <批次号> --apply")
+    return 0
+
+
+def cmd_drop_batch(args) -> int:
+    """删掉一个导入批次的全部交易（解析器有 bug 时的补救路）。"""
+    vault = _vault(args)
+    enc = secure_store.encrypted_path(vault)
+
+    if args.apply:
+        if os.path.exists(enc):
+            fixups.backup(enc)
+        with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+            fixups.drop_batch(ledger, args.batch_id, apply=True)
+    else:
+        with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+            fixups.drop_batch(ledger, args.batch_id, apply=False)
+    return 0
+
+
+def cmd_fix_source(args) -> int:
+    """把 txn.source 修正成「以 batch.source 为准」（历史数据修正）。"""
+    vault = _vault(args)
+    enc = secure_store.encrypted_path(vault)
+
+    if args.apply:
+        if os.path.exists(enc):
+            fixups.backup(enc)
+        with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+            fixups.fix_source_labels(ledger, apply=True)
+    else:
+        with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+            fixups.fix_source_labels(ledger, apply=False)
+    return 0
+
+
+# --------------------------------------------------------------------------
+
 def cmd_recompute(args) -> int:
     vault = _vault(args)
     enc = secure_store.encrypted_path(vault)
@@ -756,6 +826,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-archive", dest="archive", action="store_false",
                    help="不把原始文件复制进 vault 归档")
     p.set_defaults(archive=True, func=cmd_import)
+
+    # ---- batches ----
+    p = _add_vault(sub.add_parser("batches", help="列出导入批次（查哪一批是坏的）"))
+    p.set_defaults(func=cmd_batches)
+
+    # ---- drop-batch ----
+    p = _add_vault(sub.add_parser(
+        "drop-batch",
+        help="删掉一个批次的全部交易（解析器出 bug、库里已有错数据时用）"))
+    p.add_argument("batch_id", help="批次号，先用 batches 查")
+    p.add_argument("--apply", action="store_true",
+                   help="真删（会先自动备份密文）。不加则只试算")
+    p.set_defaults(func=cmd_drop_batch)
+
+    # ---- fix-source ----
+    p = _add_vault(sub.add_parser(
+        "fix-source", help="把历史交易的 source 修正成以批次来源为准"))
+    p.add_argument("--apply", action="store_true",
+                   help="真改（会先自动备份密文）。不加则只试算")
+    p.set_defaults(func=cmd_fix_source)
 
     # ---- review ----
     p = _add_vault(sub.add_parser("review", help="确认疑似重复"))

@@ -442,3 +442,101 @@ def strip_raw(ledger: Ledger, apply: bool = False,
     ledger.conn.commit()
     emit(f"已整理 {len(changes)} 笔的 raw。")
     return {"changed": len(changes), "applied": True, "lost_direction": lost}
+
+
+def drop_batch(ledger: Ledger, batch_id: str, apply: bool = False,
+               emit: Callable[[str], None] = print) -> dict:
+    """删掉一个导入批次的全部交易。默认只试算。
+
+    为什么需要这个命令：
+        解析器有 bug 时（实测踩到过两次 —— 紧凑日期认不出、
+        PDF 空单元格导致列左移），错误数据已经写进库了。
+        这时不能只靠「下次导入自动跳过」——
+        L1 去重要求「同源 + 同交易单号」，而银行 PDF **没有单号**，
+        重导会被判成 L2 疑似重复或者干脆写不进去。
+        唯一干净的路是**把这一批删掉，重新导入**。
+
+    试算是必须的：删数据不可逆，而「哪一批是坏的」这个判断
+    只有人做得出来（脚本只知道批次号，不知道那个批次是不是错的）。
+
+    **删批次表里的记录也要一起删**：留着会出现「批次说写了 N 笔、
+    库里查不到」的悬空状态，而账本的「导入批次」列表会显示它。
+    """
+    row = ledger.conn.execute(
+        "SELECT batch_id, source, path, imported_at, parsed, inserted "
+        "FROM batch WHERE batch_id = ?", (batch_id,)).fetchone()
+    if not row:
+        emit(f"找不到批次 {batch_id}。")
+        emit("  看现有批次：python -m importer batches")
+        return {"found": False, "txns": 0, "applied": False}
+
+    n = ledger.conn.execute(
+        "SELECT COUNT(*) n FROM txn WHERE batch_id = ?", (batch_id,)).fetchone()["n"]
+
+    emit(f"批次 {row['batch_id']}（{row['imported_at']}）")
+    emit(f"  来源 : {row['source']}")
+    emit(f"  文件 : {row['path']}")
+    emit(f"  解析 : {row['parsed']} 笔，写入 {row['inserted']} 笔")
+    emit(f"  库里 : 该批次的交易 {n} 笔")
+    # 路径是账单文件名，可能带账号。脱敏成只剩目录 + 文件名长度。
+    emit(f"  提示 : 删掉之后要重新导入这个文件（原始文件在 vault\\raw\\ 有归档）")
+
+    if not apply:
+        emit("这是试算，**没有改动任何数据**。确认要删就加 --apply。")
+        return {"found": True, "txns": n, "applied": False}
+
+    ledger.conn.execute("DELETE FROM txn WHERE batch_id = ?", (batch_id,))
+    ledger.conn.execute("DELETE FROM batch WHERE batch_id = ?", (batch_id,))
+    ledger.conn.commit()
+    left = ledger.conn.execute(
+        "SELECT COUNT(*) n FROM txn WHERE batch_id = ?", (batch_id,)).fetchone()["n"]
+    emit(f"已删除：交易 {n - left} 笔，批次记录 1 条（复查剩 {left} 笔）。")
+    emit("重新导入：把那个文件放回 inbox 再跑一次 monthly 即可。")
+    return {"found": True, "txns": n, "applied": True}
+
+
+def fix_source_labels(ledger: Ledger, apply: bool = False,
+                      emit: Callable[[str], None] = print) -> dict:
+    """把 txn.source 修正成「以 batch.source 为准」。
+
+    实测踩到的：早期版本的 `parse_bank_pdf` 只在结果对象上改了 source，
+    每笔 Txn 仍写死 `bank_ocr` —— 于是 PDF 导入的数据在界面和报表里
+    都被显示成「银行卡截图」。
+
+    **为什么必须修**：去重的 L1 层要求「同源 + 同交易单号」。
+    source 标错的话，将来重新导入同一个 PDF 会被当成跨渠道，
+    走 L2 变成「疑似重复」，让用户白点几十次按钮。
+
+    判据用 **batch.source**（批次来源是权威的），而不是 txn.source ——
+    后者正是错的那个。
+    """
+    rows = ledger.conn.execute(
+        "SELECT t.id, t.source, b.source AS bsrc FROM txn t "
+        "JOIN batch b ON b.batch_id = t.batch_id "
+        "WHERE t.source IS NOT b.source").fetchall()
+
+    emit(f"source 与批次不一致的交易：{len(rows)} 笔")
+    if not rows:
+        emit("没有需要修正的。")
+        return {"changed": 0, "applied": False}
+
+    seen: dict = {}
+    for r in rows:
+        seen[(r["source"], r["bsrc"])] = seen.get((r["source"], r["bsrc"]), 0) + 1
+    for (wrong, right), n in sorted(seen.items(), key=lambda x: -x[1]):
+        emit(f"  {wrong} → {right}：{n} 笔")
+
+    if not apply:
+        emit("这是试算，**没有改动任何数据**。确认无误后加 --apply 执行。")
+        return {"changed": len(rows), "applied": False}
+
+    n = ledger.conn.execute(
+        "UPDATE txn SET source = ("
+        "  SELECT b.source FROM batch b WHERE b.batch_id = txn.batch_id) "
+        "WHERE batch_id IN (SELECT batch_id FROM batch) "
+        "AND source IS NOT ("
+        "  SELECT b.source FROM batch b WHERE b.batch_id = txn.batch_id)"
+    ).rowcount
+    ledger.conn.commit()
+    emit(f"已修正 {n} 笔的 source。")
+    return {"changed": n, "applied": True}
