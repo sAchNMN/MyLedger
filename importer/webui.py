@@ -36,7 +36,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
-from . import fixups, monthly, review_ui, secure_store, sourcehint
+from . import fixups, monthly, review_ui, secure_store, sourcehint, suggest
 from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
 from .model import SOURCE_LABELS
 from .pipeline import import_file
@@ -219,6 +219,62 @@ def act_setcat(vault: str, params: dict, log) -> dict:
     return result
 
 
+def act_setcat_batch(vault: str, params: dict, log) -> dict:
+    """批量采纳建议分类。
+
+    为什么不复用 act_setcat 循环调：那样每采纳一个商户都要开关一次账本，
+    而开账本 = 解密 + 校验，几十个商户就是几十次解密。批量一次性干完更快，
+    更重要的是**只备份一次密文** —— 分批写会堆出一批备份，而它们之间
+    只差一两个商户，恢复时根本分不清该用哪份。
+
+    校验放在写库之前整体过一遍：宁可一条都不写，也不能写一半炸在中间。
+    """
+    raw_items = params.get("items")
+    if not isinstance(raw_items, list) or not raw_items:
+        raise ValueError("没有选中任何商户")
+
+    pairs: list = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        merchant = str(raw.get("merchant") or "").strip()
+        category = str(raw.get("category") or "").strip()
+        if not merchant:
+            continue
+        if category not in CATEGORIES:
+            raise ValueError(f"「{merchant}」的分类不合法：{category or '（空）'}")
+        pairs.append((merchant, category))
+    if not pairs:
+        raise ValueError("没有选中任何商户")
+
+    apply_ = bool(params.get("apply"))
+    if apply_:
+        enc = secure_store.encrypted_path(vault)
+        if os.path.exists(enc):
+            fixups.backup(enc, emit=log)
+
+    total = 0
+    changed_merchants = 0
+    # 试算也要 save_on_exit=True：人工指定本身就是要落缓存的，
+    # 那是「以后导入自动生效」的依据，和回不回填历史是两件事。
+    with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+        for merchant, category in pairs:
+            key = set_manual(ledger, merchant, category)
+            log(f"记下缓存：{key} → {category}")
+            res = fixups.apply_manual(ledger, merchant, category,
+                                      apply=apply_, emit=log)
+            changed = int(res.get("changed") or 0)
+            total += changed
+            changed_merchants += 1 if changed else 0
+
+    log(f"共采纳 {len(pairs)} 个商户，历史交易改动 {total} 笔。")
+    if not apply_:
+        log("上面是试算：缓存已写，但**已入库的历史交易没动**。确认后点「执行」。")
+    return {"merchants": len(pairs), "changed": total,
+            "changed_merchants": changed_merchants,
+            "applied": apply_, "exit": 0}
+
+
 def act_resolve(vault: str, params: dict, log) -> dict:
     """疑似重复的人工裁定。只改标记，不删记录。"""
     txn_id = int(params.get("id"))
@@ -241,6 +297,7 @@ ACTIONS = {
     "setsrc": act_setsrc,
     "recompute": act_recompute,
     "setcat": act_setcat,
+    "setcat_batch": act_setcat_batch,
     "resolve": act_resolve,
 }
 
@@ -546,6 +603,62 @@ def unmatched_data(vault: str, month: str = "", mask: bool = False) -> dict:
     }
 
 
+def suggest_data(vault: str, mask: bool = False) -> dict:
+    """未分类商户的**建议分类**。只读，什么都不写。
+
+    刻意**不接本地 AI**：这个接口是页面一切到「未分类」就要刷的，
+    模型推理可能几秒也可能超时，不该让「看一眼」变成「等一下」。
+    要用模型补建议，去命令行跑 `importer suggest --ai` ——
+    那边本来就是人守着等、逐条敲回车的节奏。
+
+    遮蔽模式（mask=1）下依据换成**不点名**的说法：依据原文里嵌着**别的**商户名，
+    遮蔽了商户列却在依据列漏出去，"可安全外发"就成了空话。
+    """
+    with secure_store.open_encrypted(vault, save_on_exit=False, warn=lambda s: None) as ledger:
+        rows = suggest.build_suggestions(ledger)
+
+    hit = [r for r in rows if r.category]
+    by_source: dict = {}
+    for r in hit:
+        by_source[r.source] = by_source.get(r.source, 0) + 1
+
+    def _show(name: str) -> str:
+        return mask_merchant(name) if mask else name
+
+    def _evidence(r) -> str:
+        if not r.evidence:
+            return ""
+        return suggest.evidence_label(r.source) if mask else r.evidence
+
+    return {
+        "mask": mask,
+        "totals": {
+            "merchants": len(rows),
+            "with": len(hit),
+            "without": len(rows) - len(hit),
+            "amount": money(sum(r.total for r in hit)),
+            "all_amount": money(sum(r.total for r in rows)),
+        },
+        "by_source": by_source,
+        "rows": [
+            {
+                "merchant": _show(r.merchant),
+                "n": r.count,
+                "expense": money(r.expense),
+                "income": money(r.income),
+                "category": r.category,
+                "source": r.source,
+                "confidence": round(r.confidence, 2),
+                "evidence": _evidence(r),
+                # 商品名在遮蔽模式下直接不显示：它不是商户名，
+                # 打码规则套不上，而它同样可能写着具体买了什么。
+                "sample_item": "" if mask else r.sample_item,
+            }
+            for r in rows
+        ],
+    }
+
+
 SOURCES_TEXT = """支付宝
   手机：支付宝 → 我的 → 账单 → 右上角「…」→ 开具交易流水证明 → 用于个人对账
   下载得到的是「带密码的 zip」，密码是申请时你自己设的。
@@ -576,7 +689,10 @@ USAGE_TEXT = """怎么用（只有三步）
 
 之后：
   * 「疑似重复」页会告诉你有没有需要人工判定的笔（点两个大按钮）
-  * 「未分类」页列出规则认不出来的商户，选个分类点一下就归位了
+  * 「未分类」页列出规则认不出来的商户。上半部分先给一批**建议**
+    （照抄账本里已有的归类，省打字），你勾上、看一眼依据、可以改，
+    再点「采纳」—— 每一条都是你自己拍板的，程序不会替你写
+    * 没依据的它会空着让你自己填，不会瞎猜一个让你点头
   * 「报表」页看每个月钱花在哪
 
 安全边界
@@ -1290,14 +1406,30 @@ function renderUnmatched() {
   const el = document.getElementById("tab-unmatched");
   if (!STATE) return;
   el.innerHTML =
-    "<div class='note'>规则靠关键词，总有认不出来的商户。这里列出它们，" +
-    "你选个分类点一下就行 —— 不写代码、不改规则表，按商户精确生效，" +
-    "不会影响别的交易。</div>" +
+    "<div class='note'>规则靠关键词，总有认不出来的商户。这一页分三步：先看<b>建议</b>" +
+    "（批量拍板，最快），剩下没建议的用下面的<b>归位</b>手填，" +
+    "最底下是全部<b>明细</b>。<br>" +
+    "不管哪条路，都是不写代码、不改规则表，按商户精确生效，不会影响别的交易。</div>" +
     "<div class='card'><h2>未分类汇总</h2><div id='um-totals' class='grid'></div>" +
     "<div class='row' style='margin-top:12px'>" +
     "<label class='chk'><input type='checkbox' id='um-mask'" + (maskOn ? " checked" : "") +
     "> 遮蔽商户名（这份输出可以安全发给别人看）</label>" +
     "<button class='act ghost sm' onclick='loadUnmatched()'>刷新</button></div></div>" +
+    "<div class='card'><h2>建议分类<span id='sg-n'></span></h2>" +
+    "<div class='note'>先说清楚：这<b>不是</b>自动分类。下面每条都要你自己点头才写进账本。" +
+    "程序只负责把账本里<b>已经存在的信息</b>搬到眼前 —— 省的是打字，不是判断。<br>" +
+    "默认只勾了<b>有依据</b>的（依据写在表里）；没依据的一律留空让你自己填，" +
+    "宁可空着也不瞎猜一个让你点头。</div>" +
+    "<div id='sg-body'><div class='muted'>正在加载…</div></div>" +
+    "<div id='sg-actions' class='row' style='margin-top:12px'>" +
+    "<button class='act ghost sm' onclick='sgSelect(\"hit\")'>选有依据的</button>" +
+    "<button class='act ghost sm' onclick='sgSelect(true)'>全选</button>" +
+    "<button class='act ghost sm' onclick='sgSelect(false)'>全不选</button>" +
+    "<span style='flex:1'></span>" +
+    "<button class='act ghost' onclick='doSuggestApply(false)'>采纳选中（试算）</button>" +
+    "<button class='act good' onclick='doSuggestApply(true)'>采纳选中（执行）</button>" +
+    "</div><p class='muted' style='margin:10px 0 0'>「试算」只写商户→分类缓存（以后导入自动生效），" +
+    "不动已入库的历史；「执行」才会一并回填历史，写库前自动备份密文。</p></div>" +
     "<div class='card'><h2>归位</h2><div class='row'>" +
     "<input id='um-merchant' list='um-list' placeholder='商户名（可从下表复制）' style='flex:1;min-width:240px'>" +
     "<datalist id='um-list'></datalist>" +
@@ -1305,17 +1437,108 @@ function renderUnmatched() {
       "<option value='" + esc(c) + "'>" + esc(c) + "</option>").join("") + "</select>" +
     "<button class='act ghost' onclick='doSetcat(false)'>试算</button>" +
     "<button class='act good' onclick='doSetcat(true)'>执行</button></div>" +
-    "<p class='muted' style='margin:10px 0 0'>「试算」只写缓存（以后导入自动生效），" +
-    "不动已入库的历史交易；「执行」才会一并回填历史，写库前自动备份密文。</p></div>" +
+    "<p class='muted' style='margin:10px 0 0'>给上面建议里<b>没有</b>的商户补分类用。" +
+    "同样默认试算，确认后执行。</p></div>" +
     "<div class='card'><h2>已人工指定的商户<span id='um-manual-n'></span></h2>" +
     "<div id='um-manual'></div></div>" +
     "<div class='card'><h2>未分类明细<span id='um-scope'></span></h2>" +
     "<div id='um-body'><div class='muted'>正在加载…</div></div></div>";
-  document.getElementById("um-mask").onchange = e => { maskOn = e.target.checked; loadUnmatched(); };
+  document.getElementById("um-mask").onchange = e => {
+    maskOn = e.target.checked; loadUnmatched(); loadSuggestions();
+  };
   const s = document.getElementById("um-cat");
   if (s && s.options.length) s.value = "餐饮";
   loadUnmatched();
+  loadSuggestions();
   renderManual();
+}
+
+/* 建议分类：勾选 + 可改分类 + 试算/执行。
+   SG 里存的是当前这份建议，提交时按行号回取 —— 下拉框改过的值以 DOM 为准，
+   SG 只提供商户名（下拉框里没有的选项不会凭空冒出来）。 */
+let SG = [];
+async function loadSuggestions() {
+  const box = document.getElementById("sg-body");
+  if (!box) return;
+  try {
+    const d = await api("/api/suggest?mask=" + (maskOn ? "1" : "0"));
+    SG = d.rows || [];
+    const t = d.totals || {};
+    document.getElementById("sg-n").textContent =
+      t.merchants ? ("共 " + t.merchants + " 个商户，其中 " + t.with + " 个有依据") : "";
+
+    // 遮蔽模式不给采纳：提交的是页面上的商户名，打了码再提交会把「张·」这种
+    // 东西当成商户写进缓存表。而且打码了你自己也看不出在给谁拍板。
+    const acts = document.getElementById("sg-actions");
+    if (acts) acts.style.display = maskOn ? "none" : "flex";
+
+    if (!SG.length) {
+      box.innerHTML = "<p class='muted'>没有未分类的商户，规则覆盖得不错。</p>";
+      return;
+    }
+    let h = "<table><thead><tr>" +
+            (maskOn ? "" : "<th style='width:26px'></th>") +
+            "<th>商户</th>" +
+            "<th class='num'>笔数</th><th class='num'>支出</th><th class='num'>收入</th>" +
+            "<th>" + (maskOn ? "建议分类" : "分类（可改）") + "</th>" +
+            "<th>依据 / 商品名</th></tr></thead><tbody>";
+    SG.forEach((r, i) => {
+      const opts = (STATE.categories || []).map(c =>
+        "<option value='" + esc(c) + "'" + (c === r.category ? " selected" : "") +
+        ">" + esc(c) + "</option>").join("");
+      let sel;
+      if (maskOn) {
+        sel = r.category ? esc(r.category) : "<span class='muted'>—</span>";
+      } else {
+        sel = "<select id='sg-cat-" + i + "'>" +
+              (r.category ? "" : "<option value=''>（选一个）</option>") + opts + "</select>";
+      }
+      let ev = r.evidence ? esc(r.evidence) : "<span class='muted'>没依据，自己填</span>";
+      if (r.sample_item)
+        ev += "<br><span class='muted'>商品名：" + esc(r.sample_item) + "</span>";
+      h += "<tr>" +
+           (maskOn ? "" :
+             "<td><input type='checkbox' id='sg-chk-" + i + "'" +
+             (r.category ? " checked" : "") + "></td>") +
+           "<td>" + esc(r.merchant) + "</td>" +
+           "<td class='num'>" + r.n + "</td>" +
+           "<td class='num'>" + esc(r.expense) + "</td>" +
+           "<td class='num'>" + esc(r.income) + "</td>" +
+           "<td>" + sel + "</td><td>" + ev + "</td></tr>";
+    });
+    box.innerHTML = h + "</tbody></table>" +
+      (maskOn ? "<p class='muted' style='margin:10px 0 0'>遮蔽模式只看不改 —— " +
+                "关掉上面的「遮蔽商户名」才能勾采纳。</p>" : "");
+  } catch (e) {
+    box.innerHTML = "<div class='warn'>" + esc(e.message) + "</div>";
+  }
+}
+function sgSelect(what) {
+  SG.forEach((r, i) => {
+    const box = document.getElementById("sg-chk-" + i);
+    if (!box) return;
+    if (what === "hit") box.checked = !!r.category;
+    else box.checked = !!what;
+  });
+}
+async function doSuggestApply(apply) {
+  const items = [], missing = [];
+  SG.forEach((r, i) => {
+    const chk = document.getElementById("sg-chk-" + i);
+    if (!chk || !chk.checked) return;
+    const sel = document.getElementById("sg-cat-" + i);
+    const category = sel ? sel.value : "";
+    if (!category) missing.push(r.merchant);
+    else items.push({ merchant: r.merchant, category: category });
+  });
+  // 缺分类的先整批拦下来 —— 提交到一半才报错，人不知道前面那几条到底写了没。
+  if (missing.length) { alert("这几个勾了但没选分类：\n" + missing.join("、")); return; }
+  if (!items.length) { alert("先勾上要采纳的商户。"); return; }
+  const word = apply ? "执行（会回填历史，写库前自动备份）" : "试算（只写缓存）";
+  if (!confirm("采纳 " + items.length + " 个商户的分类？\n本次是：" + word)) return;
+  await runJob("setcat_batch", { items: items, apply: !!apply },
+    "采纳建议分类：" + items.length + " 个商户");
+  renderUnmatched();
 }
 async function loadUnmatched() {
   const body = document.getElementById("um-body");
@@ -1837,6 +2060,15 @@ def build_server(vault: str, *, port: int = DEFAULT_PORT, host: str = "127.0.0.1
                                   "totals": {"n": 0, "merchants": 0, "expense": "0.00",
                                              "income": "0.00", "expense_all": "0.00", "share": 0.0},
                                   "rows": []}))
+                    return
+                if path == "/api/suggest":
+                    mask = query.get("mask", ["0"])[0] == "1"
+                    self._json(console.quick(
+                        lambda: suggest_data(vault, mask),
+                        fallback={"mask": mask,
+                                  "totals": {"merchants": 0, "with": 0, "without": 0,
+                                             "amount": "0.00", "all_amount": "0.00"},
+                                  "by_source": {}, "rows": []}))
                     return
                 if path == "/api/classify":
                     mask = query.get("mask", ["0"])[0] == "1"
