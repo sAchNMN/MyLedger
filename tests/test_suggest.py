@@ -179,6 +179,36 @@ def run() -> int:
 
     print()
     print("=" * 78)
+    print("7. 商户自己的历史归类就是依据（不会因为「跳过自己」而漏掉）")
+    print("=" * 78)
+    # 真实账本里就有这种：同一个商户，早先某批被规则认出来了，
+    # 后面某批没认出来 —— 于是它「既已归类又未分类」，答案就在库里。
+    #
+    # 用裸 SQL 而不是 add()：那个助手按商户名整体覆盖分类，
+    # 造不出「同一名下既有已归类、又有未分类」的混杂状态。
+    ledger = fresh_ledger()
+    ledger.conn.executemany(
+        "INSERT INTO txn (source, ts, amount, direction, counterparty,"
+        " item, category, review, fingerprint) VALUES (?,?,?,?,?,?,?,?,?)",
+        [("alipay", "2026-09-01 12:00:00", "30.00", "expense",
+          "反复出现的店", "午餐", "餐饮", "", "fp-self-1"),
+         ("alipay", "2026-09-11 12:00:00", "31.00", "expense",
+          "反复出现的店", "晚餐", DEFAULT_CATEGORY, "", "fp-self-2")])
+    ledger.conn.commit()
+
+    items = suggest.build_suggestions(ledger)
+    check("只挑出这一个商户", len(items), 1)
+    item = items[0]
+    check("挑出了这一个商户", item.merchant, normalize_text("反复出现的店"))
+    check("笔数是 1（只数未分类的）", item.count, 1)
+    check("建议来自它自己的历史", item.category, "餐饮")
+    check("来源是 self", item.source, suggest.SOURCE_SELF)
+    check("self 比子串命中更可信", item.confidence > suggest.CONF_CONTAINS, True)
+    # count 数的是**已归类**的笔数（未分类的行根本没进 known），这里是 1 笔
+    check("依据写明有多少笔", "1 笔" in item.evidence, True)
+
+    print()
+    print("=" * 78)
     if FAILURES:
         print(f"失败 {len(FAILURES)} 项：")
         for item in FAILURES:
