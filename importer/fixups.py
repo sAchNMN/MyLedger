@@ -31,7 +31,14 @@ from .categorize import (
     classify_by_rules,
     manual_map,
 )
-from .model import DIRECTION_EXPENSE, DIRECTION_NEUTRAL, normalize_text, parse_direction
+from .model import (
+    DIRECTION_EXPENSE,
+    DIRECTION_NEUTRAL,
+    STATUS_KILLS_EXPENSE,
+    normalize_text,
+    parse_direction,
+    status_verdict,
+)
 from .store import Ledger
 
 # 平台在「收/支」列里会用到的值
@@ -52,7 +59,7 @@ _SIGN_DERIVED_SOURCES = frozenset({"bank_ocr", "bank_pdf"})
 
 # raw 里允许留下的键（与 sources._row_summary 写入的一致）。
 # strip_raw 用这张表来判断一条老 raw 需不需要整理。
-_RAW_KEEP = ("来源", "编码", "表头行", "数据行", "方向列",
+_RAW_KEEP = ("来源", "编码", "表头行", "数据行", "方向列", "状态列",
              "字段数", "非空字段数", "金额列有值", "时间列有值")
 
 
@@ -65,6 +72,11 @@ def _derive_direction(row) -> str:
 
     原始行里存着平台自己的「收/支」列，用它重算即可。
     没有方向列的来源（银行 PDF / 截图，方向是按金额正负号定的）保持原样。
+
+    status 列**不走 raw**，直接读 txn 表里那一列：
+    状态是固定词表（交易成功 / 已全额退款 / 交易关闭…），和方向列同一性质，
+    但它本来就是一个正式字段，存了就没必要再抄一份到 raw 里。
+    读正式列还有个好处：用户手工在界面上改过状态也能被 recompute 认到。
 
     raw 存在三种形态，每一种都要处理对：
 
@@ -110,28 +122,88 @@ def _derive_direction(row) -> str:
     return row["direction"]
 
 
+def _base_direction(row) -> str:
+    """重推「未经任何压中性处理」的基础方向。
+
+    和 _derive_direction 的区别只有一处，但这一处是整套双向性的命门：
+    _derive_direction 查不到方向线索时返回 row["direction"]，
+    而那一列可能**已经被压成中性**了（比如上一轮 recompute 的结果）。
+    拿它当基础方向去跑状态判定，就等于在一个「已经是中性」的值上
+    判断「要不要压成中性」—— 状态改回正常时永远压不回来。
+
+    所以这里查不到就返回 expense（视为最原始的形态），
+    让状态判定总能从「支出」这个起点重新出发。
+    代价是：如果一笔收入本来就查不到方向线索，会被误当成支出 ——
+    但那一笔随后要么被状态压成中性、要么按非消费分类压成中性，
+    最坏情况是它留在支出里，而它本来就在那儿。不是新增的风险。
+    """
+    if row["source"] in _SIGN_DERIVED_SOURCES:
+        return row["direction"]
+    try:
+        raw = json.loads(row["raw"])
+    except Exception:
+        return DIRECTION_EXPENSE
+    if "方向列" in raw:
+        return parse_direction(raw.get("方向列") or "", row["counterparty"], row["item"])
+    cells = raw.get("原始", [])
+    idx = _DIRECTION_INDEX_HINT.get(row["source"])
+    if idx is not None and idx < len(cells):
+        return parse_direction(cells[idx], row["counterparty"], row["item"])
+    for cell in cells:
+        if normalize_text(cell) in _DIRECTION_LABELS:
+            return parse_direction(cell, row["counterparty"], row["item"])
+    return DIRECTION_EXPENSE
+
+
+def _apply_status_to(direction: str, status: str) -> str:
+    """按状态列决定要不要把支出压成中性。这是**纯函数**，可逆。
+
+    保持纯函数（而不是像以前那样在导入时就把方向改掉）是刻意的：
+    这样状态规则改了以后，跑一次 recompute 就能双向还原 ——
+    「已过期」这个判断明天被证明是错的，方向能自己回去。
+
+    认不出来的状态一律不动。
+
+    ⚠ 调用方必须把「未经状态处理的基础方向」传进来，不能传已经压过的值。
+    原因：一旦某笔被压成中性，再压第二次是空操作，而当状态改回正常时
+    就再也压不回来了 —— 看起来像幂等，实际是单向压死。
+    """
+    if direction == DIRECTION_EXPENSE and status_verdict(status) in STATUS_KILLS_EXPENSE:
+        return DIRECTION_NEUTRAL
+    return direction
+
+
 def recompute(ledger: Ledger, apply: bool = False,
               emit: Callable[[str], None] = print) -> dict:
     """按当前规则重算分类与方向。默认只试算。
 
     幂等且**双向**：方向从原始行重推，所以规则改回来时也能还原。
 
-    分类优先级：**人工指定 > 规则 > 原值**。
+    分类优先级：**人工指定 > 平台分类 > 规则 > 原值**（ML-011 起）。
     人工指定必须排第一 —— 否则用户刚手工纠正的分类，跑一次 recompute
-    就被规则改回去，等于这个功能没做。原值垫底是为了「规则认不出来的
-    交易不要被洗成未分类」。
+    就被规则改回去，等于这个功能没做。平台分类排第二是因为它是平台
+    **已经判好**的结果，比我们靠关键词猜的准。原值垫底是为了
+    「规则认不出来的交易不要被洗成未分类」。
+
+    方向判定是双向的：先从「收/支」列重推基础方向，再按状态列决定
+    要不要压成中性。两个环节都是纯函数，规则改回来时都能还原。
     """
     manual = manual_map(ledger)
 
     rows = ledger.conn.execute(
-        "SELECT id, source, direction, category, counterparty, item, amount, raw FROM txn"
+        "SELECT id, source, direction, category, counterparty, item, amount,"
+        " status, platform_category, raw FROM txn"
     ).fetchall()
 
     changes = []
     for r in rows:
         merchant = normalize_text(r["counterparty"])
-        new_cat = category_for(merchant, r["counterparty"], r["item"], manual) or r["category"]
-        new_dir = _derive_direction(r)
+        new_cat = category_for(merchant, r["counterparty"], r["item"], manual,
+                               r["source"], r["platform_category"] or "") or r["category"]
+        # 方向：先从「收/支」列重推，再按状态列决定要不要压中性。
+        # 顺序不能反 —— 状态判定是作用在「确认为支出」的记录上的，
+        # 如果先压了中性，状态那一步就没有支出了。
+        new_dir = _apply_status_to(_base_direction(r), r["status"] or "")
         # 非消费分类只压支出，收入保留（家里给的生活费要算收入）
         if new_cat in NON_CONSUMPTION_CATEGORIES and new_dir == DIRECTION_EXPENSE:
             new_dir = DIRECTION_NEUTRAL
@@ -220,7 +292,8 @@ def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
     # 而商户名可能有全角/多余空白这类差异。账本规模（几千笔以内）下这样最稳。
     rows = [
         r for r in ledger.conn.execute(
-            "SELECT id, source, direction, category, counterparty, item, amount, raw FROM txn"
+            "SELECT id, source, direction, category, counterparty, item, amount,"
+            " status, platform_category, raw FROM txn"
         ).fetchall()
         if normalize_text(r["counterparty"]) == key
     ]
@@ -228,10 +301,11 @@ def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
     changes = []
     for r in rows:
         if target is None:
-            new_cat = classify_by_rules(r["counterparty"], r["item"]) or DEFAULT_CATEGORY
+            new_cat = (classify_by_rules(r["counterparty"], r["item"])
+                       or DEFAULT_CATEGORY)
         else:
             new_cat = target
-        new_dir = _derive_direction(r)
+        new_dir = _apply_status_to(_base_direction(r), r["status"] or "")
         if new_cat in NON_CONSUMPTION_CATEGORIES and new_dir == DIRECTION_EXPENSE:
             new_dir = DIRECTION_NEUTRAL
         if new_cat != r["category"] or new_dir != r["direction"]:

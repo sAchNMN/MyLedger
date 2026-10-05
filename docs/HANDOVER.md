@@ -50,7 +50,7 @@
 | 历史 raw 里的整行原文清理 | ✅ `recompute --strip-raw`，默认只试算 |
 | 未分类盘点（哪些商户没归类） | ✅ `unmatched`，商户名可遮蔽后安全外发 |
 | 手工指定分类（按商户，优先级最高） | ✅ `setcat`，可回填历史交易 |
-| 本地网页控制台（日常不用记命令） | ✅ 双击 `MyLedger.cmd`，7 个页面：概览/导入/疑似重复/报表/未分类/历史修正/帮助 |
+| 本地网页控制台（日常不用记命令） | ✅ 双击 `MyLedger.cmd`，8 个页面：概览/导入/疑似重复/报表/未分类/分类诊断/历史修正/帮助 |
 | 报告（月度支出构成 / 收入） | ✅ 可用 |
 | 任何写入失败都不会被当成成功 | ✅ 批次状态机，见 §5.9 |
 | 后台日志最小化（不含交易内容） | ✅ 结构化白名单日志，见 §5.10 |
@@ -91,12 +91,13 @@ Desktop\MyLedger\                     ← Git 仓库：只有代码 + 合成假�
 │   ├── secure_store.py  内存库 + DPAPI 加密落盘
 │   ├── credentials.py   DPAPI 封装（只加解密，不存密码）
 │   ├── categorize.py    分类规则 + 本地 AI
+│   ├── platformmap.py    平台自带分类 → 本地分类的映射（ML-011）
 │   ├── fixups.py        历史数据按新规则修正
 │   ├── power.py         电源闸门
 │   ├── render.py        终端排版与报表
 │   ├── monthly.py       月度批处理编排
 │   ├── review_ui.py     疑似重复的本地网页确认界面
-│   ├── webui.py         本地网页控制台（7 个页面，见 §3.1）
+│   ├── webui.py         本地网页控制台（8 个页面，见 §3.1）
 │   └── cli.py           命令行入口
 ├── MyLedger.cmd         根目录一键启动器（双击开控制台）
 ├── scripts\
@@ -279,22 +280,27 @@ started ──→ writing ──→ committed ──→ archived
 
 之后**每次**打开都会检查明文残留并强提醒 —— 安全提示只提醒一次等于没提醒。
 隔离是移动不是删除：校验逻辑本身也可能有 bug，删掉的责任留给用户确认后自己承担。
-### 5.12 分类优先级：人工 > 规则 > 原值，且「人工」必须排第一
+### 5.12 分类优先级：人工 > 平台分类 > 规则 > 原值，且「人工」必须排第一
 
-三个来源都会给分类：规则表、本地 AI、人工指定。优先级写死如下：
+四个来源都会给分类：平台自带类目、规则表、本地 AI、人工指定。优先级写死如下：
 
 | 场景 | 优先级 | 存在哪 |
 |---|---|---|
-| 新导入交易 | 人工指定 > 商户缓存（规则/AI 的历史结论）> 规则 | `merchant_category` 表 |
-| `recompute` / 回填历史 | 人工指定 > 规则 > 原值 | 同上 |
+| 新导入交易 | 人工指定 > 平台分类 > 商户缓存（规则/AI 的历史结论）> 规则 | `merchant_category` 表 + `txn.platform_category` 列 |
+| `recompute` / 回填历史 | 人工指定 > 平台分类 > 规则 > 原值 | 同上 |
 
-两条不能动的规矩：
+三条不能动的规矩：
 
 1. **人工指定永远第一，任何路径都不许覆盖它。**
    `_remember()` 里有一道守卫：`decided_by='manual'` 的记录，
    规则和 AI 来写都直接返回。少了这道，用户手工改完分类，
    下次导入同商户时规则一命中就把它悄悄改回去——功能等于没做。
-2. **`recompute` 的原值垫底，`apply_manual` 撤销时却要落到「未分类」。**
+2. **平台分类不进商户缓存。**
+   缓存是「商户 → 分类」的一对一映射，而平台分类是**逐笔**的
+   （连锁超市既卖日用品也卖盒饭）。写进缓存等于把其中一笔的答案
+   固化成这个商户「永远」的分类，另一笔就被误伤了。
+   `setcat` 人工指定仍然进缓存 —— 那是人的决定，逐笔差异就该由人逐笔定。
+3. **`recompute` 的原值垫底，`apply_manual` 撤销时却要落到「未分类」。**
    看似矛盾，其实各有用意：
    `recompute` 是在全库重算，原值垫底是为了不把「本地 AI 给过的分类」
    洗成未分类；而撤销人工指定是个明确动作，用户必须看到分类真的变回去了，
@@ -587,12 +593,18 @@ python -m importer setcat "商户名" 餐饮 --apply     # 同时改已入库的
 python -m importer setcat --list                   # 看已有哪些人工指定
 python -m importer setcat --clear "商户名" --apply  # 撤销，退回规则判定
 
+# 分类与状态判定诊断（只读）
+python -m importer classify                        # 平台分类认出了什么、状态压掉了什么
+python -m importer classify --mask                 # 原文遮蔽，这份输出可安全外发
+python -m importer classify --month 2026-09
+
 # 结构探针（换银行时先跑，输出全脱敏）
 <venv>\Scripts\python.exe scripts\bank-pdf-probe.py "账单.pdf"
 
 # 测试（全部独立脚本，退出码 0 = 通过）
 <venv>\Scripts\python.exe tests\test_dedup.py
 <venv>\Scripts\python.exe tests\test_manual_category.py
+<venv>\Scripts\python.exe tests\test_platform_category.py
 ```
 
 所有命令都支持 `--vault <目录>`，默认 `%USERPROFILE%\MyLedgerVault`。
@@ -648,10 +660,45 @@ python -m importer setcat --clear "商户名" --apply  # 撤销，退回规则�
 - **手工指定分类** `setcat`：按商户粒度、优先级最高、可回填历史、可撤销。
 - **未分类盘点** `unmatched`：按商户聚合，`--mask` 遮蔽后输出可安全外发。
 - 两者的优先级与撤销语义见 §5.12，踩过的坑见 §6.19 / §6.20。
-- **本地网页控制台**：双击 `MyLedger.cmd` 启动，7 个页面覆盖全部日常操作，
+- **本地网页控制台**：双击 `MyLedger.cmd` 启动，8 个页面覆盖全部日常操作，
   不再需要记命令。架构见 §3.1，踩过的坑见 §6.21（cmd 中文截断）。
 - **边界回归测试** `tests/test_webui.py`：令牌鉴权、密码不落盘不泄露、
   并发 409、只读接口、启动器编码约定。
+
+### ML-011：平台自带分类 + 交易状态
+
+这一轮把账单里两列「平台已经判好」的信息接进来 —— 以前它们被解析了却
+从没被读过（`sources.py` 里的 `category_raw` 别名定义了但没人调用，
+`txn.status` 存了也没有任何判定读它）。
+
+- **平台分类**：支付宝「交易分类」/ 微信「交易类型」/ 银行「交易类型」。
+  优先级插在人工指定之后、关键词规则之前。映射表 `importer/platformmap.py`。
+- **交易状态**：支付宝「交易状态」/ 微信「当前状态」。判定为
+  `failed`/`refunded`/`pending` 的**支出**压成中性，不再计入总支出；
+  记录留在库里可追溯。`unknown` 一律不动方向。
+- **新增只读诊断** `classify`（CLI + 网页「分类诊断」页）：摊开每层的实际
+  命中，把「还没被映射的类目」「还认不出来的状态值」单列出来。
+- 设计细节与三条纪律见 `IMPORT-DESIGN.md` §2b。
+- 回归测试 `tests/test_platform_category.py`（12 组，含判定顺序、
+  零信息量拒绝、缓存不污染、双向重推）。
+
+**踩到的坑（都写进代码注释了）**：
+
+1. 状态判定顺序必须是 `failed → refunded → ok`。「退款成功」含「成功」
+   两字，先匹 ok 会把全额退款算成正常消费 —— 这条数据从任何角度看都正常，
+   不会有任何异常暴露它。
+2. `recompute` 重推方向时必须传「未经状态处理的基础方向」。传已压过的值，
+   状态改回正常时就再也压不回来 —— 看起来像幂等，实际是单向压死。
+3. 平台分类不能进 `merchant_category` 缓存（逐笔 vs 一对一，见上）。
+4. `platformmap` 不能在模块顶层 `from .categorize import CATEGORIES`
+   —— `categorize` 要 import 它，直接写就是循环导入。
+5. 银行 PDF 之前一律走无表头的自动识别，白白丢掉「交易名称 / 交易渠道 /
+   附言」三列。现在先试表头，认不出来再退回。
+
+**隐私边界没变**：`platform_category` 是新增的正式列，但取值是**有限固定词**
+（平台类目名），和已有的「方向列」同一性质 —— 不是自由文本，不会把商户名
+或金额捎带出去。`test_raw_minimization.py` / `test_legacy_raw_compat.py`
+里关于它的断言已按新事实更新，但守的仍然是同一条：**raw 里不许有它**。
 
 ---
 

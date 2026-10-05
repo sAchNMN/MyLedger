@@ -32,12 +32,117 @@ DIRECTION_EXPENSE = "expense"
 DIRECTION_INCOME = "income"
 DIRECTION_NEUTRAL = "neutral"
 
+# --------------------------------------------------------------------------
+# 交易状态判定
+#
+# 平台的状态列回答的是一个问题：**这笔钱到底有没有真的花出去。**
+# 这是账单里最容易被忽略、但对「月支出」影响最大的一列：
+#
+#     支付宝「交易关闭」  —— 付了但交易被撤销/超时关闭，钱没扣（常见于共享单车
+#                           押金、免密支付失败、订单取消）
+#     微信「已全额退款」  —— 钱回来了，那笔支出等于没发生
+#     微信「已过期」      —— 红包/转账超时退回零钱，钱根本没离开过
+#     微信「对方已收钱」  —— 这才是真花出去了
+#
+# 不判的后果非常具体：月支出被虚高，而这种虚高在报表上看起来完全正常。
+#
+# 判定顺序刻意是 failed → refunded → pending → ok，**不是按「成功」先判**。
+# 因为「退款成功」这个值里含有「成功」两个字：先判 ok 的话，
+# 一笔全额退款会被当成正常消费稳稳地算进支出，这正是最该避免的那种错。
+# --------------------------------------------------------------------------
+
+STATUS_OK = "ok"                # 确认完成，钱真的出去了
+STATUS_REFUNDED = "refunded"    # 钱回来了（退款）
+STATUS_FAILED = "failed"        # 交易没成立（关闭/取消/失败/过期）
+STATUS_PENDING = "pending"      # 还没定论
+STATUS_UNKNOWN = "unknown"      # 没有状态列，或值认不出来
+
+# 判为「没花出去」的值。闭单、退款、超时退回都在这里。
+_STATUS_FAILED_WORDS = (
+    "交易关闭", "支付失败", "交易失败", "已取消", "取消成功", "交易取消",
+    "已关闭", "关闭", "失败", "未支付", "待付款", "已过期", "过期", "失效",
+)
+
+# 判为「钱回来了」的值。**必须排在 ok 之前判**，见上面的注释。
+_STATUS_REFUNDED_WORDS = (
+    "已全额退款", "全额退款", "部分退款", "已退款", "退款成功", "退款",
+    "已退回", "退回", "已返还", "返还",
+)
+
+_STATUS_PENDING_WORDS = (
+    "交易中", "处理中", "待确认", "待支付", "等待", "冻结", "授权中", "确认中",
+)
+
+# 确认完成。注意「成功」放在最后匹配，且只在前面都没命中时才算数。
+_STATUS_OK_WORDS = (
+    "交易成功", "支付成功", "对方已收钱", "朋友已收钱", "已转账", "收款成功",
+    "已存入零钱", "充值完成", "提现成功", "已到账", "已入账", "还款成功",
+    "已结清", "成功",
+)
+
+
+def status_verdict(status: str) -> str:
+    """把平台的交易状态/当前状态转成四种结论之一。
+
+    认不出来就返回 unknown，**不猜**。原因和 fixups._derive_direction 里
+    「查不到就别猜」是同一条纪律：把「已过期」误判成 ok 或 failed，
+    都会让一笔钱的去留凭空翻转，而用户没有任何线索去发现。
+    """
+    text = normalize_text(status)
+    if not text:
+        return STATUS_UNKNOWN
+    for word in _STATUS_FAILED_WORDS:
+        if word in text:
+            return STATUS_FAILED
+    for word in _STATUS_REFUNDED_WORDS:
+        if word in text:
+            return STATUS_REFUNDED
+    for word in _STATUS_PENDING_WORDS:
+        if word in text:
+            return STATUS_PENDING
+    for word in _STATUS_OK_WORDS:
+        if word in text:
+            return STATUS_OK
+    return STATUS_UNKNOWN
+
+
+# 状态为这几种时，**支出**要被压成中性（钱没真的花出去）
+STATUS_KILLS_EXPENSE = frozenset({STATUS_FAILED, STATUS_REFUNDED, STATUS_PENDING})
+
+
+def status_note(status: str) -> str:
+    """给人看的一句话结论。只输出状态词和结论，不含任何其他字段。"""
+    verdict = status_verdict(status)
+    labels = {
+        STATUS_OK: "已确认完成",
+        STATUS_REFUNDED: "已退款（钱回来了）",
+        STATUS_FAILED: "交易未成立（钱没花出去）",
+        STATUS_PENDING: "尚未完成",
+        STATUS_UNKNOWN: "状态无法识别",
+    }
+    return labels[verdict]
+
+
 _DIRECTION_MAP = {
     "支出": DIRECTION_EXPENSE,
     "收入": DIRECTION_INCOME,
     "不计收支": DIRECTION_NEUTRAL,
     "中性交易": DIRECTION_NEUTRAL,
     "其他": DIRECTION_NEUTRAL,
+    # 银行流水用「借/贷」记账：贷 = 钱进来，借 = 钱出去。
+    # 这是复式记账的惯例（贷方增加借方减少），各家银行的 PDF 都这么印。
+    "借": DIRECTION_EXPENSE,
+    "贷": DIRECTION_INCOME,
+    "借方": DIRECTION_EXPENSE,
+    "贷方": DIRECTION_INCOME,
+    "借方发生额": DIRECTION_EXPENSE,
+    "贷方发生额": DIRECTION_INCOME,
+    "收": DIRECTION_INCOME,
+    "付": DIRECTION_EXPENSE,
+    "转入": DIRECTION_INCOME,
+    "转出": DIRECTION_EXPENSE,
+    "存入": DIRECTION_INCOME,
+    "支取": DIRECTION_EXPENSE,
     "": DIRECTION_NEUTRAL,
 }
 
@@ -173,6 +278,7 @@ class Txn:
     item: str = ""                    # 商品 / 商品说明
     method: str = ""                  # 收付款方式 / 支付方式
     status: str = ""                  # 交易状态 / 当前状态
+    platform_category: str = ""       # 平台自带的分类原文（支付宝「交易分类」/ 微信「交易类型」）
     txn_id: str = ""                  # 交易单号 / 交易订单号（跨批次去重的主力）
     merchant_order_id: str = ""       # 商户单号 / 商家订单号
     note: str = ""                    # 备注
@@ -261,6 +367,8 @@ FIELD_LABELS = {
     "counterparty": "交易对方",
     "item": "商品",
     "txn_id": "交易单号",
+    "status": "交易状态",
+    "platform_category": "平台分类",
 }
 
 

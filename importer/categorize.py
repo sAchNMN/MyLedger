@@ -22,7 +22,15 @@ import urllib.request
 from datetime import datetime
 from typing import Iterable, Optional
 
-from .model import DIRECTION_EXPENSE, DIRECTION_NEUTRAL, Txn, normalize_text
+from .model import (
+    DIRECTION_EXPENSE,
+    DIRECTION_NEUTRAL,
+    STATUS_KILLS_EXPENSE,
+    Txn,
+    normalize_text,
+    status_verdict,
+)
+from .platformmap import platform_category as _platform_category
 from .power import require_ac
 
 # --------------------------------------------------------------------------
@@ -175,13 +183,22 @@ def clear_manual(ledger, merchant: str) -> bool:
 
 
 def category_for(merchant_key: str, counterparty: str, item: str = "",
-                 manual: Optional[dict[str, str]] = None) -> Optional[str]:
-    """分类优先级：人工指定 > 规则 > None（没命中）。
+                 manual: Optional[dict[str, str]] = None,
+                 source: str = "", platform_raw: str = "") -> Optional[str]:
+    """分类优先级：人工指定 > 平台分类 > 规则 > None（没命中）。
 
     把优先级集中在这一处，recompute 与导入两条路径就不会各自漂移。
+
+    平台分类放在规则**之上**、人工指定**之下**：
+    支付宝的「餐饮美食」是平台判好的，比我们靠「食堂」两个字猜更准；
+    但用户手工纠正过的必须压过平台——人永远是最权威的（见 MEMORY 铁律第 5 条）。
     """
     if manual and merchant_key in manual:
         return manual[merchant_key]
+    if platform_raw:
+        hit = _platform_category(source, platform_raw)
+        if hit:
+            return hit
     return classify_by_rules(counterparty, item)
 
 
@@ -267,6 +284,30 @@ def ai_classify(merchants: list[str], url: str = DEFAULT_AI_URL,
 # 编排
 # --------------------------------------------------------------------------
 
+def _apply_status(txns) -> int:
+    """把「状态显示这笔没真花出去」的**支出**压成中性。返回改动笔数。
+
+    支付宝「交易关闭」、微信「已全额退款」「已过期」都属于这一类。
+    记录留在账本里（可追溯、能对账），但不再计入支出 ——
+    它的钱要么从没出去，要么已经回来了。
+
+    **只对支出生效，收入一律保留。**
+    理由和 _apply_non_consumption 一样：退款回来的 100 元是真实入账，
+    压成中性会让「收入」凭空少一块。
+
+    状态认不出来（STATUS_UNKNOWN）时**不动**方向：
+    宁可放过一笔可疑的，也不要凭猜把一笔真消费从报表里抹掉 ——
+    后者这种错你永远不会发现。
+    """
+    changed = 0
+    for txn in txns:
+        if (txn.direction == DIRECTION_EXPENSE
+                and status_verdict(txn.status) in STATUS_KILLS_EXPENSE):
+            txn.direction = DIRECTION_NEUTRAL
+            changed += 1
+    return changed
+
+
 def _apply_non_consumption(txns) -> int:
     """把落在「非消费」分类里的**支出**压成中性。返回改动笔数。
 
@@ -290,24 +331,54 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
                ai_url: str = DEFAULT_AI_URL, ai_model: str = DEFAULT_AI_MODEL,
                ignore_power: bool = False) -> dict:
     """给交易打分类标签。返回统计信息。"""
-    stats = {"rules": 0, "cache": 0, "ai": 0, "unmatched": 0, "ai_used": False,
-             "neutralised": 0}
+    stats = {"manual": 0, "platform": 0, "rules": 0, "cache": 0, "ai": 0,
+             "unmatched": 0, "ai_used": False, "neutralised": 0,
+             "status_neutralised": 0}
 
-    # 先读缓存：同一个商户只判定一次
-    cache: dict[str, str] = {
-        row["merchant"]: row["category"]
-        for row in ledger.conn.execute("SELECT merchant, category FROM merchant_category")
-    }
+    # 先读缓存：同一个商户只判定一次。
+    # manual 必须单独拆出来 —— 它压过一切（包括平台分类），
+    # 混在同一个 dict 里就没法保证它先被查到。
+    cache: dict[str, str] = {}
+    manual: dict[str, str] = {}
+    for row in ledger.conn.execute(
+            "SELECT merchant, category, decided_by FROM merchant_category"):
+        if row["decided_by"] == DECIDED_BY_MANUAL:
+            manual[row["merchant"]] = row["category"]
+        else:
+            cache[row["merchant"]] = row["category"]
 
     unmatched: set[str] = set()
 
     for txn in txns:
         merchant = normalize_text(txn.counterparty)
+
+        # 1) 人工指定压过一切（含平台分类）
+        if merchant and merchant in manual:
+            txn.category = manual[merchant]
+            stats["manual"] += 1
+            continue
+
+        # 2) 平台自带分类
+        #
+        # 刻意**不查也不写** cache：cache 是「商户 → 分类」的一对一映射，
+        # 而平台分类是**逐笔**的。同一个商户完全可能在餐饮店给「餐饮美食」、
+        # 在超市给「日用百货」—— 写进 cache 等于把其中一笔的答案固化成
+        # 这个商户「永远」的分类，另一笔就被这个 cache 误伤了。
+        # 代价只是同一商户每笔多一次 dict 查找，可以忽略。
+        if txn.platform_category:
+            hit = _platform_category(txn.source, txn.platform_category)
+            if hit:
+                txn.category = hit
+                stats["platform"] += 1
+                continue
+
+        # 3) 商户缓存（之前由规则/AI 判定的结果）
         if merchant and merchant in cache:
             txn.category = cache[merchant]
             stats["cache"] += 1
             continue
 
+        # 4) 关键词规则
         hit = classify_by_rules(txn.counterparty, txn.item)
         if hit:
             txn.category = hit
@@ -321,6 +392,8 @@ def categorize(txns: Iterable[Txn], ledger, use_ai: bool = False,
         stats["unmatched"] += 1
         if merchant:
             unmatched.add(merchant)
+
+    stats["status_neutralised"] = _apply_status(txns)
 
     if not use_ai or not unmatched:
         stats["neutralised"] = _apply_non_consumption(txns)

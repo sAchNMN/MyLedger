@@ -198,7 +198,7 @@ def main() -> int:
         with secure_store.open_encrypted(vault, save_on_exit=False, warn=lambda s: None) as led:
             n1 = led.conn.execute("SELECT COUNT(*) FROM txn").fetchone()[0]
             um = led.unmatched_totals()
-        check("库里 7 笔（5 支付宝 + 2 未分类）", n1, 7)
+        check("库里 10 笔（8 支付宝 + 2 未分类）", n1, 10)
         check("未分类 2 笔 / 2 个商户", (um["n"], um["merchants"]), (2, 2))
 
         # ------------------------------------------------------------------
@@ -216,7 +216,7 @@ def main() -> int:
         check("报表合计与明细口径一致", float(rep["expense_total"].replace(",", "")) > 0, True)
         _, txt = http(port, "GET", "/api/state", token)
         st = json.loads(txt)
-        check("快照概览笔数", st["overview"]["n"], 7)
+        check("快照概览笔数", st["overview"]["n"], 10)
         check("快照里出现 2026-09", "2026-09" in st["months"], True)
 
         # ------------------------------------------------------------------
@@ -257,7 +257,7 @@ def main() -> int:
 
         with secure_store.open_encrypted(vault, save_on_exit=False, warn=lambda s: None) as led:
             n2 = led.conn.execute("SELECT COUNT(*) FROM txn").fetchone()[0]
-        check("银行 PDF 的 9 笔已入库（7 + 9）", n2, 16)
+        check("银行 PDF 的 9 笔已入库（10 + 9）", n2, 19)
 
         # ------------------------------------------------------------------
         section("10. 疑似重复接口与裁定")

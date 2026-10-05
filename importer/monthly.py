@@ -43,6 +43,7 @@ from .power import describe
 from .render import print_month, print_overview
 from .secure_store import open_encrypted
 from .sources import PARSERS, detect_source
+from . import sourcehint
 
 INBOX_DIRNAME = "inbox"
 DONE_DIRNAME = "_done"
@@ -172,6 +173,7 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
         keep: bool = False, dry_run: bool = False, auto_review: bool = True,
         log_path: Optional[str] = None,
         passwords: Optional[dict] = None,
+        source_overrides: Optional[dict] = None,
         interactive: Optional[bool] = None) -> int:
     """跑一轮月度处理。返回退出码（0 = 全部处理完，2 = 有批次没完成）。
 
@@ -183,6 +185,9 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
 
     passwords   {数据源: 密码}。网页控制台把用户在页面上填的密码从这里注入，
                 而不是让 getpass 去读一个不存在的控制台。
+    source_overrides {文件路径: 渠道}。用户在导入页逐文件选过的渠道。
+                优先级：显式指定 > 渠道记忆（sourcehint）> 启发式。
+                只对本次运行生效，不会写进记忆 —— 要永久记住请用 setsrc。
     interactive None = 按 sys.stdin.isatty() 判断。
                 网页控制台必须显式传 False —— 从 .cmd 双击启动时
                 stdin **是**终端，不传的话会误判成交互式，进而在 cmd 窗口里
@@ -272,15 +277,22 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
     session_passwords: dict = dict(passwords or {})
 
     with open_encrypted(vault, save_on_exit=not dry_run) as ledger:
+        hints = sourcehint.hint_map(ledger)
+        overrides = dict(source_overrides or {})
         for index, path in enumerate(files, start=1):
             print()
             print("-" * 72)
             print(f"处理：{os.path.basename(path)}")
 
-            source = detect_source(path)
+            chosen = overrides.get(path)
+            if chosen:
+                print(f"  渠道：手动指定为 {chosen}")
+            source = chosen or detect_source(path, hints)
             if source not in PARSERS:
+                key = sourcehint.shape_key(path)
                 print("  识别不出这是哪个渠道的账单，留在原地等你处理。")
-                print("  确认渠道后可手动指定：python -m importer import <文件> --source alipay|wechat|bank")
+                print(f"  记一次，以后同类文件（{key}）自动认：")
+                print(f"    python -m importer setsrc {key} alipay|wechat|bank_pdf")
                 fail.append((path, "无法识别数据源"))
                 note(path, index, "not_recognised")
                 continue

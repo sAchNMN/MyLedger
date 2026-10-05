@@ -93,6 +93,32 @@ BANK_OCR_ALIASES = {
     "note": ("备注",),
 }
 
+# 银行 PDF 账单（有表头）的列名。
+#
+# 为什么要和 BANK_OCR_ALIASES 分开成两张表：PDF 里的列名是银行印在纸上的
+# 规范叫法，截图 OCR 出来的是 APP 上的口语叫法。混在一张表里时，
+# 「摘要」会同时被 item 和 note 抢（build_index 是「先命中先用」），
+# 抢到哪个全看 dict 的排列顺序 —— 这种靠运气决定的事不能留。
+#
+# 银行不提供结构化分类，只有「交易名称」这种自由文本，
+# 所以 category_raw 拿银行的「交易类型/摘要」列来顶。
+# 这三列（交易名称 / 交易渠道 / 附言）正是判断「钱有没有真花出去、
+# 算不算真消费」的主要依据，走无表头自动识别会把它们全丢掉。
+BANK_PDF_ALIASES = {
+    "ts": ("交易时间", "交易日期", "记账日期", "入账日期", "日期", "时间"),
+    "category_raw": ("交易类型", "摘要", "交易摘要"),
+    "counterparty": ("交易对方", "对方名称", "对方户名", "对方账户名",
+                     "收款方名称", "付款方名称", "收款方", "付款方",
+                     "商户名称", "对方账号", "商户"),
+    "item": ("交易名称", "摘要", "交易摘要", "用途", "说明"),
+    "amount": ("交易金额", "发生额", "金额"),
+    "direction": ("收/支", "借贷标志", "借贷方向", "借贷", "收支", "资金去向", "方向"),
+    "method": ("交易渠道", "渠道", "交易方式", "业务类型"),
+    "status": ("交易状态", "状态"),
+    "txn_id": ("交易流水号", "银行流水号", "流水号", "交易单号", "凭证号"),
+    "note": ("附言", "用途", "备注", "摘要", "交易摘要"),
+}
+
 
 def _resolve_ts(raw: str):
     """先按常规格式解析时间，失败再试 Excel 序列号。"""
@@ -198,6 +224,7 @@ def _parse_rows(
 
         counterparty = cell(row, index, "counterparty")
         item = cell(row, index, "item")
+        status = cell(row, index, "status")
 
         txns.append(Txn(
             source=source,
@@ -207,7 +234,11 @@ def _parse_rows(
             counterparty=counterparty,
             item=item,
             method=cell(row, index, "method"),
-            status=cell(row, index, "status"),
+            status=status,
+            # 平台自带的分类原文（支付宝「交易分类」/ 微信「交易类型」/ 银行「交易类型」）。
+            # 这是平台**已经判好**的结果，比我们靠关键词猜的准，落库才能在
+            # 规则迭代后回溯「当初平台怎么分的」（见 categorize / platformmap）。
+            platform_category=cell(row, index, "category_raw"),
             txn_id=cell(row, index, "txn_id"),
             merchant_order_id=cell(row, index, "merchant_order_id"),
             note=cell(row, index, "note"),
@@ -217,6 +248,7 @@ def _parse_rows(
                 "表头行": header_row + 1,
                 "数据行": row_no + 1,
                 "方向列": cell(row, index, "direction"),   # 供 fixups 重推方向用
+                "状态列": status,                          # 同上：固定词表，可重推
                 **_row_summary(row, index),
             },
         ))
@@ -458,6 +490,11 @@ def parse_bank_pdf(path: str, password: Optional[str] = None) -> ParseResult:
 
     这是银行流水最靠谱的一条路：PDF 的文字是结构化存储的，
     抽出来是精确字符 + 精确坐标，没有 OCR 的识别误差。
+
+    先按表头解析，认不出来再退回无表头的自动识别。
+    顺序不能反：银行 PDF 绝大多数是有表头的（表头行是印在纸上的），
+    走自动识别等于主动丢掉「交易名称 / 交易渠道 / 附言」三列——
+    而这三列正是判断「这笔到底算不算消费、钱有没有真花出去」的主要依据。
     """
     from .bank_pdf import extract_rows
 
@@ -465,23 +502,38 @@ def parse_bank_pdf(path: str, password: Optional[str] = None) -> ParseResult:
     notes = [f"PDF {meta['pages']} 页"]
     if meta.get("encrypted"):
         notes.append("已用密码解密")
+    origin = "、".join(notes)
+
     # source 必须一路传下去。之前只在结果对象上改 source，
     # 每笔 Txn 还是写死的 "bank_ocr" —— 界面和报表读的是 Txn.source，
     # 于是 PDF 导入的数据被显示成「银行卡截图」。
-    return _parse_bank_rows_auto(rows, path, origin="、".join(notes),
-                                 source="bank_pdf")
+    result = _parse_rows(rows, BANK_PDF_ALIASES, "bank_pdf", path, "pdf", origin)
+    if result.txns:
+        return result
+    # 没有表头（部分银行导出的是纯流水，没有列名行）
+    return _parse_bank_rows_auto(rows, path, origin=origin, source="bank_pdf")
 
 
 # --------------------------------------------------------------------------
 # 数据源自动识别
 # --------------------------------------------------------------------------
 
-def detect_source(path: str) -> str:
+def detect_source(path: str, hints: Optional[dict] = None) -> str:
     """按文件名和内容特征猜数据源。
 
     猜错的代价只是解析出 0 笔 + 明确报错，不会写坏数据，
     所以这里用启发式判断是安全的。
+
+    hints 是「形状 → 渠道」的记忆表（sourcehint.hint_map 的返回值）。
+    传了就先查记忆：用户手动指定过的形状直接认，**优先于所有启发式**。
+    传None（没账本可读，比如纯只读的路径探测）就只走启发式。
     """
+    if hints:
+        from . import sourcehint
+        remembered = hints.get(sourcehint.shape_key(path))
+        if remembered:
+            return remembered
+
     name = path.lower()
 
     # PDF 一律当银行账单。支付宝/微信导出的是 csv/xlsx/zip，不会是 PDF。

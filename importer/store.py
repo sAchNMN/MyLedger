@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS txn (
     item              TEXT DEFAULT '',
     method            TEXT DEFAULT '',
     status            TEXT DEFAULT '',
+    platform_category TEXT DEFAULT '',
     note              TEXT DEFAULT '',
     category          TEXT DEFAULT '未分类',
     match_key         TEXT,
@@ -86,6 +87,15 @@ CREATE TABLE IF NOT EXISTS merchant_category (
     merchant   TEXT PRIMARY KEY,
     category   TEXT NOT NULL,
     decided_by TEXT NOT NULL,
+    decided_at TEXT NOT NULL
+);
+
+-- 渠道记忆：形状 → 渠道。用户手动指定一次，之后同类文件自动认。
+-- 键是「形状」（ext:csv / zip:pdf）而不是文件名，因为银行账单文件名
+-- 是每月都变的流水号，按文件名记等于每个月都要重指定一次。详见 sourcehint.py。
+CREATE TABLE IF NOT EXISTS source_hint (
+    hint_key   TEXT PRIMARY KEY,
+    source     TEXT NOT NULL,
     decided_at TEXT NOT NULL
 );
 """
@@ -163,6 +173,51 @@ def _ensure_batch_status_column(conn: sqlite3.Connection) -> bool:
     return True
 
 
+def _ensure_platform_category_column(conn: sqlite3.Connection) -> bool:
+    """给老库补 platform_category 列（支付宝「交易分类」/ 微信「交易类型」原文）。
+
+    为什么不能只写在 SCHEMA 里：
+        和 batch.status / source_hint 完全同一个原因 —— 加密账本走
+        init_schema=False，schema 早就在密文里了。只靠 executescript 的话，
+        现有用户的库里根本没这一列，而 Txn.to_row() 是 asdict 出来的，
+        INSERT 语句里带了 :platform_category，SQLite 会直接报
+        「table txn has no column named platform_category」——
+        整次导入崩掉，而崩的原因看起来跟「加了个平台分类」毫无关系。
+
+    老行一律补空串：它们导入时根本没读这一列，事后编一个就是造假。
+    空串在 platformmap 里查不到任何东西，行为和从前完全一致。
+    """
+    columns = [row[1] for row in conn.execute("PRAGMA table_info(txn)")]
+    if not columns or "platform_category" in columns:
+        return False
+    conn.execute("ALTER TABLE txn ADD COLUMN platform_category TEXT DEFAULT ''")
+    conn.commit()
+    return True
+
+
+def _ensure_source_hint_table(conn: sqlite3.Connection) -> bool:
+    """给老库补 source_hint 表。补了就返回 True。
+
+    为什么不能只写在 SCHEMA 里：
+        加密账本走的是 init_schema=False（schema 早就在密文里了），
+        新加的表在老用户的密文里根本不存在。只靠 executescript 的话，
+        页面会直接报「no such table: source_hint」—— 整页崩掉，
+        而崩溃原因看起来跟「渠道记忆」毫无关系，很难查。
+
+    CREATE TABLE IF NOT EXISTS 是幂等的，每次打开都调也只多一次查询。
+    """
+    names = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "source_hint" in names:
+        return False
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS source_hint ("
+        " hint_key TEXT PRIMARY KEY, source TEXT NOT NULL, decided_at TEXT NOT NULL)"
+    )
+    conn.commit()
+    return True
+
+
 class Ledger:
     """账本。所有写操作都经过去重判定。
 
@@ -180,9 +235,11 @@ class Ledger:
         if init_schema:
             self.conn.executescript(SCHEMA)
             self.conn.commit()
-        # 补列放在 init_schema 分支外面：init_schema=False 的那条路
+        # 补列补表放在 init_schema 分支外面：init_schema=False 的那条路
         # （加密账本、明文迁移）才是现有用户真正走的路径，见函数注释。
         _ensure_batch_status_column(self.conn)
+        _ensure_source_hint_table(self.conn)
+        _ensure_platform_category_column(self.conn)
         self._batch_seen_keys: set[str] = set()
         self._batch_seen_fp: dict[str, str] = {}
         self.batch_id = ""
@@ -354,10 +411,11 @@ class Ledger:
         row = txn.to_row()
         self.conn.execute(
             "INSERT OR IGNORE INTO txn (source, txn_id, merchant_order_id, ts, amount,"
-            " direction, counterparty, item, method, status, note, category, match_key,"
+            " direction, counterparty, item, method, status, platform_category, note,"
+            " category, match_key,"
             " fingerprint, batch_id, review, review_note, dup_of, raw)"
             " VALUES (:source,:txn_id,:merchant_order_id,:ts,:amount,:direction,"
-            " :counterparty,:item,:method,:status,:note,:category,:match_key,"
+            " :counterparty,:item,:method,:status,:platform_category,:note,:category,:match_key,"
             " :fingerprint,:batch_id,:review,:review_note,:dup_of,:raw)",
             {
                 **row,

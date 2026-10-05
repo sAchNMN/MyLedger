@@ -36,7 +36,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Callable, Optional
 
-from . import fixups, monthly, review_ui, secure_store
+from . import fixups, monthly, review_ui, secure_store, sourcehint
 from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
 from .model import SOURCE_LABELS
 from .pipeline import import_file
@@ -48,6 +48,10 @@ DEFAULT_PORT = 8765
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 SOURCE_LABELS_ALL = {**SOURCE_LABELS, "bank_pdf": "银行卡PDF", "unknown": "识别不出"}
+
+# 导入页「渠道」下拉框的选项。顺序按用户遇到问题的频率排：
+# 支付宝、微信最常见，银行 PDF 次之，截图 OCR 最后（它要先生成 TSV）。
+SOURCE_CHOICES = ("alipay", "wechat", "bank_pdf", "bank_ocr")
 
 
 # ==========================================================================
@@ -92,8 +96,13 @@ class LogSink(io.TextIOBase):
 # ==========================================================================
 
 def act_monthly(vault: str, params: dict, log) -> dict:
-    """月度批处理：扫投递目录 → 逐个导入 → 出月报。"""
+    """月度批处理：扫投递目录 → 逐个导入 → 出月报。
+
+    sources 是用户在导入页逐文件选的渠道 {路径: 渠道}。
+    指定了的文件走指定渠道，没指定的照常自动识别/查记忆。
+    """
     passwords = {k: v for k, v in (params.get("passwords") or {}).items() if v}
+    sources = {str(k): str(v) for k, v in (params.get("sources") or {}).items() if v}
     stream = LogSink(log)
     with contextlib.redirect_stdout(stream):
         rc = monthly.run(
@@ -106,9 +115,30 @@ def act_monthly(vault: str, params: dict, log) -> dict:
             auto_review=False,
             interactive=False,
             passwords=passwords,
+            source_overrides=sources,
         )
     stream.flush()
     return {"exit": rc, "passthrough": True}
+
+
+def act_setsrc(vault: str, params: dict, log) -> dict:
+    """记住「某个形状的文件是哪个渠道」，以后同类文件自动认。"""
+    key = str(params.get("key") or "").strip()
+    source = str(params.get("source") or "").strip()
+    if params.get("clear"):
+        with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+            removed = sourcehint.clear_hint(ledger, key)
+        return {"removed": removed, "key": key}
+
+    if source not in sourcehint.KNOWN_SOURCES:
+        raise ValueError(
+            f"不认识的渠道「{source}」。可用：{'、'.join(sourcehint.KNOWN_SOURCES)}"
+        )
+    with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+        saved = sourcehint.set_hint(ledger, key, source)
+    log(f"已记住：{saved} → {SOURCE_LABELS_ALL.get(source, source)}")
+    log("以后形状相同的文件会自动按这个渠道解析，不用再选。")
+    return {"key": saved, "source": source}
 
 
 def act_import_one(vault: str, params: dict, log) -> dict:
@@ -116,15 +146,18 @@ def act_import_one(vault: str, params: dict, log) -> dict:
     path = str(params.get("path") or "")
     if not os.path.isfile(path):
         raise ValueError(f"找不到文件：{path}")
-    source = str(params.get("source") or "auto")
-    if source == "auto":
-        source = detect_source(path)
-    if source not in PARSERS:
-        raise ValueError("这个文件识别不出渠道，请手动选一个数据源")
-
     password = params.get("password") or None
     dry_run = bool(params.get("dry_run"))
+    chosen = str(params.get("source") or "auto")
     with secure_store.open_encrypted(vault, save_on_exit=not dry_run) as ledger:
+        if params.get("remember"):
+            # 先落记忆再导：这样即使这次解析失败，下次也认得了。
+            sourcehint.set_hint(ledger, sourcehint.shape_key(path), chosen)
+        source = chosen
+        if source == "auto":
+            source = detect_source(path, sourcehint.hint_map(ledger))
+        if source not in PARSERS:
+            raise ValueError("这个文件识别不出渠道，请手动选一个数据源")
         outcome = import_file(
             path, ledger, source=source, password=password,
             use_ai=bool(params.get("ai")), archive=True, dry_run=dry_run,
@@ -205,6 +238,7 @@ def act_resolve(vault: str, params: dict, log) -> dict:
 ACTIONS = {
     "monthly": act_monthly,
     "import_one": act_import_one,
+    "setsrc": act_setsrc,
     "recompute": act_recompute,
     "setcat": act_setcat,
     "resolve": act_resolve,
@@ -215,11 +249,16 @@ ACTIONS = {
 # 只读快照
 # ==========================================================================
 
-def inbox_files(vault: str) -> list:
-    """投递目录里的待处理文件，附「要不要密码」这个关键信息。"""
+def inbox_files(vault: str, hints: Optional[dict] = None) -> list:
+    """投递目录里的待处理文件，附「要不要密码」「渠道能不能定」这些关键信息。
+
+    hints 是渠道记忆（sourcehint.hint_map 的返回值）。
+    读不出来账本时传 None，只走启发式 —— 页面上照常显示，只是
+    「记住的渠道」那列会显示成没记住。
+    """
     out = []
     for path in monthly.scan_inbox(vault):
-        source = detect_source(path)
+        source = detect_source(path, hints)
         try:
             size = os.path.getsize(path)
         except OSError:
@@ -235,6 +274,10 @@ def inbox_files(vault: str) -> list:
             "source_label": SOURCE_LABELS_ALL.get(source, source),
             "needs_password": needs,
             "size_kb": round(size / 1024, 1),
+            "shape": sourcehint.shape_key(path),
+            # 记住的是哪个形状：页面上要显示给用户看，
+            # 否则「下次自动认」是空话，用户不知道自己在承诺什么。
+            "remembered": bool(hints and sourcehint.shape_key(path) in hints),
         })
     return out
 
@@ -249,6 +292,9 @@ def snapshot(vault: str, warn: Callable[[str], None] = print) -> dict:
         "power": describe(),
         "ac": is_on_ac(),
         "categories": list(CATEGORIES),
+        "source_choices": [
+            {"value": v, "label": SOURCE_LABELS_ALL.get(v, v)} for v in SOURCE_CHOICES
+        ],
         "encrypted_exists": info["encrypted_exists"],
         "encrypted_size_kb": round(info["encrypted_size"] / 1024, 1),
         "encrypted_path": info["encrypted_path"],
@@ -259,6 +305,7 @@ def snapshot(vault: str, warn: Callable[[str], None] = print) -> dict:
         "months": [],
         "unmatched": None,
         "manual": [],
+        "hints": [],
         "review_left": 0,
         "error": "",
     }
@@ -268,6 +315,15 @@ def snapshot(vault: str, warn: Callable[[str], None] = print) -> dict:
 
     try:
         with secure_store.open_encrypted(vault, save_on_exit=False, warn=warn) as ledger:
+            # 渠道记忆要先读出来，才能算准每个文件「是自动认的还是记住的」。
+            # inbox_files 在上面的 dict 里已经算过一次（那时还没有账本），
+            # 这里拿到记忆后重算一次，让页面显示的和实际导入的一致。
+            hints = sourcehint.hint_map(ledger)
+            out["inbox_files"] = inbox_files(vault, hints)
+            out["hints"] = [
+                {"key": k, "source": v, "label": SOURCE_LABELS_ALL.get(v, v)}
+                for k, v in sorted(hints.items())
+            ]
             txn = ledger.overall()
             row = txn["txn"]
             out["overview"] = {
@@ -335,6 +391,79 @@ def review_data(vault: str) -> dict:
         return {"items": review_ui.collect(ledger)}
 
 
+def classify_data(vault: str, month: str = "", mask: bool = False) -> dict:
+    """分类与状态判定的诊断数据（对应 CLI 的 `classify`）。
+
+    为什么要有这个页面：判定叠了四层（人工 / 平台分类 / 规则 / 原值）
+    加一个状态判定之后，光看报表无法回答「这一笔为什么是那个分类」。
+    这个接口把每一层的实际命中情况摊开，并把「还没被映射 / 认不出来」
+    的值单列出来 —— 那是迭代映射表和状态词表的唯一入口。
+
+    只读，不改任何数据。
+    """
+    from . import platformmap
+    from .model import STATUS_KILLS_EXPENSE, status_verdict
+
+    with secure_store.open_encrypted(vault, save_on_exit=False,
+                                     warn=lambda s: None) as ledger:
+        scope = " WHERE substr(ts,1,7) = ?" if month else ""
+        params = [month] if month else []
+        joiner = " AND " if scope else " WHERE "
+
+        plat_rows = ledger.conn.execute(
+            "SELECT source, platform_category, direction, COUNT(*) AS n,"
+            " SUM(CAST(amount AS REAL)) AS total FROM txn" + scope
+            + joiner + "platform_category != ''"
+            " GROUP BY source, platform_category, direction"
+            " ORDER BY total DESC", params).fetchall()
+
+        total_n = ledger.conn.execute(
+            "SELECT COUNT(*) AS n FROM txn" + scope, params).fetchone()["n"]
+
+        by_status: dict = {}
+        for r in ledger.conn.execute(
+                "SELECT status, direction, COUNT(*) AS n,"
+                " SUM(CAST(amount AS REAL)) AS total FROM txn" + scope
+                + joiner + "status != '' GROUP BY status, direction", params):
+            verdict = status_verdict(r["status"] or "")
+            slot = by_status.setdefault(r["status"], {
+                "status": r["status"], "verdict": verdict,
+                "expense": [0, 0.0], "income": [0, 0.0], "neutral": [0, 0.0],
+            })
+            slot[r["direction"]] = [r["n"], float(r["total"] or 0)]
+
+    return {
+        "month": month,
+        "mask": mask,
+        "total": total_n,
+        "platform": [
+            {
+                "source": SOURCE_LABELS_ALL.get(r["source"], r["source"]),
+                "value": mask_merchant(r["platform_category"]) if mask
+                         else r["platform_category"],
+                "hit": platformmap.platform_category(r["source"],
+                                                    r["platform_category"]) or "",
+                "n": r["n"],
+                "total": money(r["total"]),
+            }
+            for r in plat_rows
+        ],
+        "status": [
+            {
+                "status": mask_merchant(s["status"]) if mask else s["status"],
+                "verdict": s["verdict"],
+                "killed": s["verdict"] in STATUS_KILLS_EXPENSE,
+                "expense_n": s["expense"][0], "expense": money(s["expense"][1]),
+                "income_n": s["income"][0], "income": money(s["income"][1]),
+                "neutral_n": s["neutral"][0], "neutral": money(s["neutral"][1]),
+            }
+            for s in sorted(by_status.values(),
+                            key=lambda x: -(x["expense"][1] + x["income"][1]
+                                            + x["neutral"][1]))
+        ],
+    }
+
+
 def unmatched_data(vault: str, month: str = "", mask: bool = False) -> dict:
     with secure_store.open_encrypted(vault, save_on_exit=False, warn=lambda s: None) as ledger:
         totals = ledger.unmatched_totals(month or None)
@@ -383,6 +512,14 @@ USAGE_TEXT = """怎么用（只有三步）
 1. 把导出的账单文件丢进「投递目录」（上面那个路径，点按钮直接打开）
 2. 回到这个页面，进「导入」页，需要密码的文件会显示一个密码框，填上
 3. 点「开始处理」，等日志跑完
+
+渠道认错了怎么办
+  导入页每个文件都有一行「渠道」下拉框，默认是自动猜的。
+  猜错了就自己选，选完点「把手动选过的都记住」——
+  记的是**形状**（比如「装着 PDF 的压缩包」）而不是文件名，
+  所以下个月银行寄来的文件哪怕名字换了，也照样认得，不用再管。
+  认不出渠道的行会标成浅红色，那就是唯一需要你动手的地方。
+  已记住的每一条都能在「历史修正」页看到并撤销。
 
 之后：
   * 「疑似重复」页会告诉你有没有需要人工判定的笔（点两个大按钮）
@@ -447,6 +584,12 @@ PAGE = r"""<!DOCTYPE html>
   th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); }
   th { color:var(--muted); font-weight:500; font-size:12px; }
   td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  /* 认不出渠道的行标红：这是唯一需要用户动手处理的情况，
+     藏在正常行里等人去找等于没有提示。 */
+  tr.row-bad td { background:#fdf1f1; }
+  tr.row-bad .shape { color:var(--accent); }
+  .shape { font-size:11px; margin-top:2px; }
+  td select { padding:6px 9px; font-size:13px; min-width:150px; }
   tr.sum td { font-weight:600; border-top:2px solid var(--line); }
   .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   button.act { border:0; border-radius:9px; padding:10px 18px; font-size:14px; cursor:pointer;
@@ -506,6 +649,7 @@ PAGE = r"""<!DOCTYPE html>
   <button data-tab="review">疑似重复<span class="badge" id="b-review" style="display:none">0</span></button>
   <button data-tab="report">报表</button>
   <button data-tab="unmatched">未分类</button>
+  <button data-tab="classify">分类诊断</button>
   <button data-tab="fix">历史修正</button>
   <button data-tab="help">帮助</button>
 </nav>
@@ -515,6 +659,7 @@ PAGE = r"""<!DOCTYPE html>
   <div class="tab" id="tab-review"></div>
   <div class="tab" id="tab-report"></div>
   <div class="tab" id="tab-unmatched"></div>
+  <div class="tab" id="tab-classify"></div>
   <div class="tab" id="tab-fix"></div>
   <div class="tab" id="tab-help"></div>
 </main>
@@ -563,6 +708,8 @@ function show(tab) {
   if (tab === "review") renderReview();
   if (tab === "report") renderReport();
   if (tab === "unmatched") renderUnmatched();
+  if (tab === "classify") renderClassify();
+  if (tab === "fix") renderFix();
 }
 document.getElementById("nav").addEventListener("click", e => {
   const b = e.target.closest("button[data-tab]");
@@ -686,16 +833,29 @@ function renderImport() {
     h += "<p class='muted' style='margin:0'>把支付宝 / 微信导出的 zip，或银行的加密 PDF 丢进上面的目录，" +
          "再点「刷新」。</p>";
   } else {
-    h += "<table><thead><tr><th>文件</th><th>大小</th><th>识别为</th><th>密码</th></tr></thead><tbody>";
+    h += "<table><thead><tr><th>文件</th><th>大小</th><th>渠道</th><th>密码</th></tr></thead><tbody>";
     files.forEach((f, i) => {
-      h += "<tr><td>" + esc(f.name) + "</td><td class='num'>" + f.size_kb + " KB</td>" +
-           "<td>" + esc(f.source_label) + "</td><td>" +
+      const unidentified = f.source === "unknown";
+      h += "<tr" + (unidentified ? " class='row-bad'" : "") + ">" +
+           "<td>" + esc(f.name) +
+           "<div class='muted shape'>形状 " + esc(f.shape) +
+           (f.remembered ? " ·已记住渠道" : "") + "</div></td>" +
+           "<td class='num'>" + f.size_kb + " KB</td>" +
+           "<td>" + sourceSelect(f) + "</td><td>" +
            (f.needs_password
              ? "<input type='password' data-pwd='" + esc(f.source) + "' placeholder='需要密码（不保存）' style='width:190px'>"
              : "<span class='muted'>不需要</span>") +
            "</td></tr>";
     });
-    h += "</tbody></table>";
+    h += "</tbody></table>" +
+         "<p class='muted' style='margin:12px 0 0'>" +
+         "「自动」= 按文件名和内容猜。认错了就手动选一个；" +
+         "选完点「把手动选过的都记住」—— 记的是<b>形状</b>而不是文件名，" +
+         "所以下个月银行寄来的文件哪怕名字换了也照样认得。" +
+         "</p>" +
+         "<div class='row' style='margin-top:10px'>" +
+         "<button class='act ghost sm' onclick='rememberAll()'>把手动选过的都记住</button>" +
+         "</div>";
   }
   h += "<div class='row' style='margin-top:14px'>" +
        "<button class='act ghost sm' onclick='refreshState()'>刷新列表</button>" +
@@ -713,8 +873,11 @@ function renderImport() {
     el.querySelectorAll("input[data-pwd]").forEach(inp => {
       if (inp.value) passwords[inp.dataset.pwd] = inp.value;
     });
+    const sources = collectSources();
     const files = STATE.inbox_files || [];
-    const missing = files.filter(f => f.needs_password && !passwords[f.source]);
+    // 密码按「渠道」归拢，所以手动改了渠道的话要按新渠道去找密码，
+    // 否则用户明明填了密码，却因为渠道变了而没被送进去。
+    const missing = files.filter(f => f.needs_password && !passwords[sources[f.path] || f.source]);
     if (missing.length) {
       const ok = confirm("有 " + missing.length + " 个加密文件没填密码，它们会被跳过。继续吗？");
       if (!ok) return;
@@ -723,11 +886,53 @@ function renderImport() {
       ai: document.getElementById("opt-ai").checked,
       keep: document.getElementById("opt-keep").checked,
       dry_run: document.getElementById("opt-dry").checked,
-      passwords: passwords
+      passwords: passwords,
+      sources: sources
     }, "月度处理");
     el.querySelectorAll("input[data-pwd]").forEach(inp => inp.value = "");
     if (j && j.status === "done" && (j.result || {}).exit === 2) show("import");
   };
+}
+
+/* 渠道下拉框。默认选中自动识别出来的那个；
+   认不出来时停在「自动（识别不出）」，逼用户自己选一个。 */
+function sourceSelect(f) {
+  const cur = f.source === "unknown" ? "" : f.source;
+  let h = "<select data-src='" + esc(f.path) + "'>" +
+          "<option value=''" + (cur ? "" : " selected") + ">自动（识别不出，请选）</option>";
+  (STATE.source_choices || []).forEach(c => {
+    h += "<option value='" + esc(c.value) + "'" + (cur === c.value ? " selected" : "") + ">" +
+         esc(c.label) + "</option>";
+  });
+  return h + "</select>";
+}
+
+/* 只收集「用户手动改过」的文件。选「自动」的不算 ——
+   把自动的结果也记一遍会让记忆表变成启发式的影子，
+   启发式升级后那些旧记录反而会挡住新逻辑。 */
+function collectSources() {
+  const out = {};
+  document.querySelectorAll("select[data-src]").forEach(s => {
+    if (s.value) out[s.dataset.src] = s.value;
+  });
+  return out;
+}
+
+async function rememberAll() {
+  const sources = collectSources();
+  const keys = Object.keys(sources);
+  if (!keys.length) { alert("还没有手动选过任何渠道。"); return; }
+  for (const p of keys) {
+    const f = (STATE.inbox_files || []).find(x => x.path === p);
+    try {
+      await api("/api/setsrc", { key: f ? f.shape : "", source: sources[p] });
+    } catch (e) {
+      alert("记住 " + (f ? f.name : p) + " 失败：" + e.message);
+      return;
+    }
+  }
+  await refreshState();
+  alert("已记住 " + keys.length + " 个形状。以后同类文件自动按你选的渠道解析。");
 }
 
 /* ---------------- 疑似重复 ---------------- */
@@ -943,7 +1148,150 @@ function renderFix() {
     "</div></div>" +
     "<div class='card'><h2>说明</h2><p class='muted' style='margin:0'>" +
     "「试算」会把每一笔的改动列在下面的日志里，看完确认没问题再点「执行」。<br>" +
-    "因为试算不动数据，所以试算和执行的输出应该完全一致；不一致说明两次之间账本被别处改过。</p></div>";
+    "因为试算不动数据，所以试算和执行的输出应该完全一致；不一致说明两次之间账本被别处改过。</p></div>" +
+    renderHints();
+}
+/* ---------------- 分类诊断 ----------------
+   判定叠了四层分类 + 一个状态判定之后，光看报表答不出
+   「这一笔为什么是那个分类」。这个页面把每层的实际命中摊开，
+   并把「还没被映射 / 还认不出来」的值单列出来 —— 那是迭代
+   映射表和状态词表的唯一入口。 */
+function renderClassify() {
+  const el = document.getElementById("tab-classify");
+  if (!STATE) return;
+  el.innerHTML =
+    "<div class='note'>分类优先级：<b>人工指定 &gt; 平台分类 &gt; 关键词规则 &gt; 原值</b>。" +
+    "「平台分类」是支付宝账单里的「交易分类」列、微信的「交易类型」列 —— " +
+    "平台已经判好的结果，比靠商户名猜更准，所以它排在规则前面，但压不过你的人工指定。" +
+    "<br><br>方向判定：先看「收/支」列，再看<b>交易状态</b>。" +
+    "状态显示这笔没真花出去（交易关闭 / 已退款 / 已过期）的，方向压成不计收支 —— " +
+    "记录留着能对账，但不进总支出。状态认不出来时一律按原样保留，宁可放过也不误伤。</div>" +
+    "<div class='card'><h2>平台分类</h2>" +
+    "<div class='row'><label class='chk'><input type='checkbox' id='cf-mask'" +
+    (maskOn ? " checked" : "") + "> 遮蔽原文（这份输出可以安全发给别人看）</label>" +
+    "<button class='act ghost sm' onclick='loadClassify()'>刷新</button></div>" +
+    "<div id='cf-plat'><div class='muted'>正在加载…</div></div></div>" +
+    "<div class='card'><h2>交易状态</h2><div id='cf-stat'>" +
+    "<div class='muted'>正在加载…</div></div></div>";
+  document.getElementById("cf-mask").onchange = e => { maskOn = e.target.checked; loadClassify(); };
+  loadClassify();
+}
+async function loadClassify() {
+  const pb = document.getElementById("cf-plat");
+  const sb = document.getElementById("cf-stat");
+  if (!pb || !sb) return;
+  try {
+    const d = await api("/api/classify?mask=" + (maskOn ? "1" : "0"));
+    if (!d.platform.length) {
+      pb.innerHTML = "<p class='muted' style='margin:10px 0 0'>库里还没有平台分类数据。" +
+        "支付宝账单看「交易分类」列、微信看「交易类型」列 —— 这两列只有<b>新版导出</b>里有，" +
+        "老账单可能没有，属正常。这种情况下分类全部靠关键词规则和你的手工指定。</p>";
+    } else {
+      let h = "<table><thead><tr><th>来源</th><th>平台分类</th><th>判定为</th>" +
+              "<th class='num'>笔数</th><th class='num'>金额(元)</th></tr></thead><tbody>";
+      d.platform.forEach(r => {
+        const miss = !r.hit;
+        h += "<tr" + (miss ? " style='color:#b06'" : "") + "><td>" + esc(r.source) +
+             "</td><td>" + esc(r.value) + "</td><td>" +
+             (miss ? "<span class='muted'>（未映射，靠规则兜底）</span>" : esc(r.hit)) +
+             "</td><td class='num'>" + r.n + "</td><td class='num'>" +
+             esc(r.total) + "</td></tr>";
+      });
+      const miss = d.platform.filter(r => !r.hit);
+      if (miss.length) {
+        h += "</tbody></table><p class='muted' style='margin:10px 0 0'>" +
+             "标色的几行是平台分类<b>没能直接认出来</b>的，靠关键词规则兜底。" +
+             "微信「商户消费」属于这一类（它占九成流水，信息量为零，属正常）。" +
+             "如果看到明显该认却没认的值，往 <code>importer/platformmap.py</code> 里加一行，</p>";
+      } else {
+        h += "</tbody></table>";
+      }
+      pb.innerHTML = h;
+    }
+
+    if (!d.status.length) {
+      sb.innerHTML = "<p class='muted' style='margin:10px 0 0'>库里没有交易状态数据。" +
+        "支付宝的「交易状态」列、微信的「当前状态」列，老版本导出可能没有。</p>";
+    } else {
+      const names = {ok: "已确认完成", refunded: "已退款", failed: "未成立",
+                     pending: "未完成", unknown: "认不出（按原样保留）"};
+      let h = "<table><thead><tr><th>状态原文</th><th>判定</th><th>当前分布</th></tr></thead><tbody>";
+      let killed = 0, killedTotal = 0, unknown = [];
+      d.status.forEach(r => {
+        const parts = [];
+        if (r.expense_n) parts.push("支出 " + r.expense_n + " 笔 / " + r.expense + " 元");
+        if (r.income_n) parts.push("收入 " + r.income_n + " 笔 / " + r.income + " 元");
+        if (r.neutral_n) parts.push("中性 " + r.neutral_n + " 笔 / " + r.neutral + " 元");
+        if (r.killed && r.neutral_n) {
+          killed += r.neutral_n;
+          killedTotal += parseFloat(String(r.neutral).replace(/,/g, "")) || 0;
+        }
+        if (r.verdict === "unknown") unknown.push(r.status);
+        h += "<tr><td>" + esc(r.status) + "</td><td>" +
+             esc(names[r.verdict] || r.verdict) + "</td><td class='muted'>" +
+             esc(parts.join("；") || "（无）") + "</td></tr>";
+      });
+      h += "</tbody></table>";
+      if (killed) {
+        h += "<p class='muted' style='margin:10px 0 0'>落在「未成立 / 已退款 / 未完成」" +
+             "这些状态里的共 " + killed + " 笔、" +
+             killedTotal.toLocaleString("en-US", {minimumFractionDigits: 2,
+               maximumFractionDigits: 2}) +
+             " 元，全部不在支出里 —— 总支出因此少了这一块。</p>";
+      }
+      h += "<p class='muted' style='margin:6px 0 0'>提示：标「中性」的那些里，" +
+           "有一部分在状态判定之前就已经是不计收支了（余额宝转入、信用卡还款），" +
+           "它们不是被状态剔掉的。</p>";
+      if (unknown.length) {
+        h += "<p class='muted' style='margin:10px 0 0'>这些状态值本工具<b>还认不出来</b>，" +
+             "一律按原样保留（宁可放过也不误伤）：<code>" +
+             unknown.map(esc).join("</code>、<code>") +
+             "</code>。确认语义后加进 <code>importer/model.py</code> 的 <code>_STATUS_*</code> 词表。</p>";
+      }
+      sb.innerHTML = h;
+    }
+  } catch (e) {
+    pb.innerHTML = "<div class='warn'>" + esc(e.message) + "</div>";
+  }
+}
+/* 已记住的渠道。必须能在这里看到并撤销 ——
+   一条记错的记忆会一直生效，用户却完全不知道它存在，
+   那比「没有记忆功能」更坏。 */
+function renderHints() {
+  const hints = (STATE && STATE.hints) || [];
+  if (!hints.length) {
+    return "<div class='card'><h2>记住的渠道</h2><p class='muted' style='margin:0'>" +
+           "还没有记住任何渠道。导入页把渠道选错时，点「把手动选过的都记住」就会出现在这里。" +
+           "</p></div>";
+  }
+  let h = "<div class='card'><h2>记住的渠道<span>" + hints.length + " 条</span></h2>" +
+          "<div class='note'>键是<b>形状</b>（文件后缀 / 压缩包里装的东西），不是文件名。" +
+          "所以银行每月寄来的流水号文件名不一样也不影响。" +
+          "命中记忆的渠道会<b>优先于</b>自动识别。</div>" +
+          "<table><thead><tr><th>形状</th><th>渠道</th><th></th></tr></thead><tbody>";
+  hints.forEach(x => {
+    h += "<tr><td><code>" + esc(x.key) + "</code></td><td>" + esc(x.label) + "</td>" +
+         "<td class='num'><button class='act ghost sm' data-forget='" + esc(x.key) +
+         "'>撤销</button></td></tr>";
+  });
+  return h + "</tbody></table></div>";
+}
+/* 事件委托：记忆条目是动态渲染的，逐个绑 onclick 会漏。
+   用 data 属性 + 一个监听器，重新渲染后照样生效。 */
+document.addEventListener("click", e => {
+  const btn = e.target.closest("[data-forget]");
+  if (btn) forgetHint(btn.dataset.forget);
+});
+async function forgetHint(key) {
+  if (!confirm("撤销「" + key + "」这条记忆？\n撤销后这类文件会回到自动识别。")) return;
+  try {
+    await api("/api/setsrc", { key: key, clear: true });
+  } catch (e) {
+    alert("撤销失败：" + e.message);
+    return;
+  }
+  await refreshState();
+  renderFix();
 }
 async function doRecompute(apply) {
   if (apply && !confirm("确认按当前规则重写历史数据？\n（会先自动备份加密账本，可回滚）")) return;
@@ -993,12 +1341,17 @@ async function refreshState() {
   const tab = on ? on.dataset.tab : "home";
   if (tab === "import") renderImport();
   if (tab === "unmatched") renderUnmatched();
+  if (tab === "classify") renderClassify();
   if (tab === "report") renderReport();
 }
 
 (async function boot() {
-  renderFix(); renderHelp();
+  renderHelp();
+  // 顺序有讲究：renderFix 里要画「记住的渠道」，那数据来自 STATE。
+  // 先 refreshState 再 renderFix，否则第一次打开是空的，
+  // 得手动点一次刷新才出现 —— 看起来像功能坏了。
   await refreshState();
+  renderFix();
   await loadReview();
   if (STATE && STATE.review_left) show("review");
 })();
@@ -1220,6 +1573,14 @@ def build_server(vault: str, *, port: int = DEFAULT_PORT, host: str = "127.0.0.1
                                   "totals": {"n": 0, "merchants": 0, "expense": "0.00",
                                              "income": "0.00", "expense_all": "0.00", "share": 0.0},
                                   "rows": []}))
+                    return
+                if path == "/api/classify":
+                    mask = query.get("mask", ["0"])[0] == "1"
+                    month = query.get("month", [""])[0]
+                    self._json(console.quick(
+                        lambda: classify_data(vault, month, mask),
+                        fallback={"month": month, "mask": mask, "total": 0,
+                                  "platform": [], "status": []}))
                     return
                 if path == "/api/job":
                     job = console.get_job(query.get("id", [""])[0])

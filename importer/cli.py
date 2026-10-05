@@ -6,7 +6,9 @@
     python -m importer import <文件...>         单文件导入
     python -m importer report [--month 2026-09] 消费汇总
     python -m importer unmatched               盘点未分类交易（按商户聚合）
+    python -m importer classify                诊断分类与状态判定（平台分类/状态认出了什么）
     python -m importer setcat <商户> <分类>     手工指定分类（优先级最高）
+    python -m importer setsrc <形状> <渠道>      记住「某形状的文件是哪个渠道」
     python -m importer recompute               按当前规则修正历史数据（默认只试算）
     python -m importer store                   查看账本存储状态
     python -m importer sources                 各渠道导出方法
@@ -26,13 +28,26 @@ import os
 import subprocess
 import sys
 
-from . import __version__, fixups, monthly, review_ui, secure_store, webui
+from . import (
+    __version__,
+    fixups,
+    monthly,
+    platformmap,
+    review_ui,
+    secure_store,
+    sourcehint,
+    webui,
+)
 from .categorize import CATEGORIES, clear_manual, manual_map, set_manual
-from .model import SOURCE_LABELS
+from .model import SOURCE_LABELS, STATUS_KILLS_EXPENSE, status_verdict
 from .pipeline import import_file
 from .render import mask_merchant, money, print_month, print_overview, table
 
 DEFAULT_VAULT = os.path.join(os.path.expanduser("~"), "MyLedgerVault")
+
+# cmd_classify 要按 source 显示中文名，而 SOURCE_LABELS 只覆盖了 txn 里的
+# 三个来源（缺 bank_pdf 的别名差异）。这里用 webui 导出的全量表。
+SOURCE_LABELS_ALL = {**SOURCE_LABELS, "bank_pdf": "银行卡PDF"}
 
 
 # --------------------------------------------------------------------------
@@ -50,13 +65,17 @@ def _vault(args) -> str:
 def cmd_import(args) -> int:
     vault = _vault(args)
     password = args.password
-    if password is None and args.source in ("alipay", "wechat") and sys.stdin.isatty():
+    # 哪些渠道要问密码：凡是账单文件可能带密码的都问。
+    # 之前只问 alipay/wechat，漏了 bank_pdf —— 而银行的加密 PDF 才是
+    # 最常见的那一种，漏掉它等于「命令行没法导银行账单」。
+    if password is None and args.source in ("alipay", "wechat", "bank_pdf") and sys.stdin.isatty():
         # 只提示一次，用完即丢；不传 --password 且是交互式时不硬要，
         # 因为文件可能已经解压过了。
         try:
             label = SOURCE_LABELS.get(args.source, args.source)
+            kind = "PDF" if args.source == "bank_pdf" else "压缩包"
             password = getpass.getpass(
-                f"{label}账单的解压密码（不回显，用完即忘，不保存；直接回车跳过）："
+                f"{label}账单的{kind}密码（不回显，用完即忘，不保存；直接回车跳过）："
             ) or None
         except (KeyboardInterrupt, EOFError):
             print()
@@ -190,6 +209,186 @@ def cmd_unmatched(args) -> int:
         if args.mask:
             print("（--mask：商户名已遮蔽，这份输出可以安全外发）")
         return 0
+
+
+# --------------------------------------------------------------------------
+# classify —— 分类判定诊断
+# --------------------------------------------------------------------------
+
+def cmd_classify(args) -> int:
+    """看清「每笔交易的分类和方向到底是怎么定下来的」。
+
+    存在的理由：这套判定有四层（人工指定 / 平台分类 / 关键词规则 / 原值）
+    加上一个状态判定，叠起来之后光看报表是看不出某一笔为什么那样的。
+    这个命令把那层叠在一起的**实际效果**摊开：
+
+      · 平台分类认出了多少笔、分别是哪些平台类目
+      · 哪些平台类目**还没被映射**（映射表该补了 —— 这是迭代映射表的唯一入口）
+      · 状态压掉了多少笔「没真花出去」的支出
+      · 状态值里有哪些是本工具还认不出来的（认不出 = 判定不了 = 需要补）
+
+    只读，不改任何数据。
+    """
+    vault = _vault(args)
+    with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+        # WHERE 子句分开攒，最后统一拼。
+        # 直接在字符串里插 WHERE 的话，无 --month 时会留下一个孤零零的
+        # 「 AND platform_category != ''」—— SQLite 报的是
+        # 「near AND: syntax error」，跟真正的原因隔着一整句，很难查。
+        scope_sql = " WHERE substr(ts,1,7) = ?" if args.month else ""
+        params = [args.month] if args.month else []
+
+        total = ledger.conn.execute(
+            f"SELECT COUNT(*) AS n FROM txn{scope_sql}", params).fetchone()["n"]
+
+        rows = ledger.conn.execute(
+            "SELECT source, platform_category, direction, COUNT(*) AS n,"
+            " SUM(CAST(amount AS REAL)) AS total FROM txn"
+            + scope_sql
+            + (" AND " if scope_sql else " WHERE ")
+            + "platform_category != ''"
+            " GROUP BY source, platform_category, direction"
+            " ORDER BY total DESC",
+            params).fetchall()
+
+        st_rows = ledger.conn.execute(
+            "SELECT status, direction, COUNT(*) AS n,"
+            " SUM(CAST(amount AS REAL)) AS total FROM txn"
+            + scope_sql
+            + (" AND " if scope_sql else " WHERE ")
+            + "status != '' GROUP BY status, direction ORDER BY total DESC",
+            params).fetchall()
+
+        # 状态分组按方向拆开统计。
+        #
+        # 为什么必须拆：direction='neutral' 的记录有两种来源 ——
+        #   a) 原本就是中性（余额宝转入、信用卡还款），压根没被状态碰过
+        #   b) 原本是支出，被状态压成中性（交易关闭的订单、已退款的消费）
+        # 只看状态维度的合计会把这两种混成一句话，读的人无从分辨。
+        #
+        # 有个信息在库里确实**已经丢了**：「一笔被压中性的记录原本是支出」
+        # 这件事，方向被压过之后就再也看不出来（raw 里只有「收/支」列的值，
+        # 能重推，但那是 recompute 的活，不该在只读诊断里现算）。
+        # 所以这里只如实呈现分组，不去猜哪一笔属于 a、哪一笔属于 b。
+        by_status: dict[tuple, dict] = {}
+        for r in ledger.conn.execute(
+                "SELECT status, direction, COUNT(*) AS n,"
+                " SUM(CAST(amount AS REAL)) AS total FROM txn"
+                + scope_sql
+                + (" AND " if scope_sql else " WHERE ") + "status != ''"
+                + " GROUP BY status, direction", params):
+            verdict = status_verdict(r["status"] or "")
+            key = (r["status"], verdict)
+            slot = by_status.setdefault(
+                key, {"expense": [0, 0.0], "income": [0, 0.0],
+                      "neutral": [0, 0.0]})
+            slot[r["direction"]] = [r["n"], float(r["total"] or 0)]
+
+    scope = args.month or "全部时间"
+    print("=" * 72)
+    print(f"分类判定诊断 · {scope} · 共 {total} 笔")
+    print()
+    print("分类优先级：人工指定 > 平台分类 > 关键词规则 > 原值")
+    print("方向判定：「收/支」列 → 交易状态（未成立/已退款的一律压成不计收支）")
+
+    if not rows:
+        print()
+        print("库里还没有平台分类数据。")
+        print("支付宝账单看「交易分类」列、微信看「交易类型」列 ——")
+        print("这两个列只在**新版导出**里有，老账单可能没有，属正常。")
+    else:
+        print()
+        print("=" * 72)
+        print("平台分类")
+        print("=" * 72)
+        body = []
+        unknown_total = 0
+        for r in rows:
+            value = r["platform_category"]
+            hit = platformmap.platform_category(r["source"], value)
+            body.append([
+                SOURCE_LABELS_ALL.get(r["source"], r["source"]),
+                value if not args.mask else mask_merchant(value),
+                hit or "（未映射）",
+                r["n"],
+                money(r["total"]),
+            ])
+            if not hit and r["direction"] == "expense":
+                unknown_total += r["total"]
+        print(table(["来源", "平台分类", "判定为", "笔数", "金额(元)"], body,
+                    ["left", "left", "left", "right", "right"]))
+        if unknown_total:
+            print()
+            print(f"其中 {money(unknown_total)} 元的支出，平台分类没能直接认出来，")
+            print("是靠关键词规则兜底的（微信「商户消费」属于这一类，属正常）。")
+            print("如果看到明显该认却没认的值，往 importer/platformmap.py 里加一行即可，")
+            print("改完跑 recompute 试算看效果。")
+
+    if by_status:
+        print()
+        print("=" * 72)
+        print("交易状态（决定这笔钱到底算不算花出去）")
+        print("=" * 72)
+        body = []
+        unrecognised = []
+        killed_expense_n = 0
+        killed_expense_total = 0.0
+        for (value, verdict), slot in sorted(
+                by_status.items(), key=lambda kv: -sum(
+                    s[1] for s in kv[1].values())):
+            label = {
+                "ok": "已确认完成",
+                "refunded": "已退款",
+                "failed": "未成立",
+                "pending": "未完成",
+                "unknown": "认不出（按原样保留）",
+            }.get(verdict, verdict)
+            exp_n, exp_total = slot["expense"]
+            inc_n, inc_total = slot["income"]
+            neu_n, neu_total = slot["neutral"]
+            if verdict in STATUS_KILLS_EXPENSE and neu_n:
+                # 落在压支出的状态里、且现在不在支出方向 = 一定没被算进支出。
+                # 但「它原本是不是支出」在库里已经**查不回来了**（方向压过之后
+                # 这个事实就消失了）。所以这里只给一个不误导的合计，
+                # 不去区分「被状态剔掉」和「本来就是中性」——
+                # 那两种的分法在 raw 里有线索，但那是 recompute 的活。
+                killed_expense_n += neu_n
+                killed_expense_total += neu_total
+            parts = []
+            if exp_n:
+                parts.append(f"支出 {exp_n} 笔 / {money(exp_total)}")
+            if inc_n:
+                parts.append(f"收入 {inc_n} 笔 / {money(inc_total)}")
+            if neu_n:
+                parts.append(f"中性 {neu_n} 笔 / {money(neu_total)}")
+            body.append([
+                value if not args.mask else mask_merchant(value),
+                label, "；".join(parts) or "（无）",
+            ])
+            if verdict == "unknown":
+                unrecognised.append(value)
+        print(table(["状态原文", "判定", "当前分布"], body))
+
+        if killed_expense_n:
+            print()
+            print(f"落在「未成立 / 已退款 / 未完成」这些状态里的共 "
+                  f"{killed_expense_n} 笔、{money(killed_expense_total)} 元，")
+            print("它们全部不在支出里 —— 报表的总支出因此少了这一块。")
+        print("（提示：表里标「中性」的那些，其中一部分在状态判定之前就已经是")
+        print("  不计收支了，比如余额宝转入、信用卡还款 —— 它们不是被状态剔掉的。）")
+        if unrecognised:
+            print()
+            print("这些状态值本工具还认不出来，一律按原样保留（宁可放过也不误伤）：")
+            for value in unrecognised:
+                print(f"  {value if not args.mask else mask_merchant(value)}")
+            print("确认语义后加进 importer/model.py 的 _STATUS_* 词表。")
+
+    print()
+    print("想重新按当前规则算一遍（默认只试算，加 --apply 才写库）：")
+    print("  python -m importer recompute")
+    if args.mask:
+        print("（--mask：商户名与状态原文已遮蔽，这份输出可以安全外发）")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -454,6 +653,67 @@ def cmd_ocr(args) -> int:
 
 
 # --------------------------------------------------------------------------
+# setsrc（渠道记忆）
+# --------------------------------------------------------------------------
+
+def cmd_setsrc(args) -> int:
+    """记住「某个形状的文件是哪个渠道」，以后同类文件自动认。
+
+    键是形状而不是文件名：银行账单文件名是每月都变的流水号，
+    按文件名记等于每个月都要重指定一次，那就没有「记住」的意义了。
+    形状由 sourcehint.shape_key() 算：ext:csv / zip:pdf / name:某个文件
+    """
+    vault = _vault(args)
+    choices = list(sourcehint.KNOWN_SOURCES)
+
+    if args.of:
+        path = args.of
+        if not os.path.isfile(path):
+            print(f"找不到文件：{path}")
+            return 2
+        key = sourcehint.shape_key(path)
+        print(f"{key}")
+        print(f"记成某个渠道：python -m importer setsrc {key} <{'|'.join(choices)}>")
+        return 0
+
+    if args.list:
+        with secure_store.open_encrypted(vault, save_on_exit=False) as ledger:
+            hints = sourcehint.hint_map(ledger)
+        if not hints:
+            print("还没有记住任何渠道。识别不出来时用：")
+            print("  python -m importer setsrc <形状> <渠道>")
+            return 0
+        print("已记住的渠道：")
+        for key, source in sorted(hints.items()):
+            print(f"  {key:34s} → {SOURCE_LABELS.get(source, source)}")
+        return 0
+
+    if not args.key:
+        print("用法：")
+        print("  python -m importer setsrc --list                        列出已记住的")
+        print("  python -m importer setsrc --of <文件路径>                看这个文件的形状键")
+        print(f"  python -m importer setsrc <形状> <渠道>              渠道：{'|'.join(choices)}")
+        print("  python -m importer setsrc <形状> --clear                撤销")
+        return 2
+
+    if args.clear:
+        with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+            removed = sourcehint.clear_hint(ledger, args.key)
+        print(f"已撤销：{args.key}" if removed else f"没有这条记忆：{args.key}")
+        return 0 if removed else 2
+
+    if not args.source:
+        print(f"要记成哪个渠道？{'|'.join(choices)}")
+        return 2
+
+    with secure_store.open_encrypted(vault, save_on_exit=True) as ledger:
+        key = sourcehint.set_hint(ledger, args.key, args.source)
+    print(f"已记住：{key} → {SOURCE_LABELS.get(args.source, args.source)}")
+    print("以后形状相同的文件会自动按这个渠道解析。")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -534,6 +794,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="商户名遮蔽后输出，便于把结果安全外发")
     p.set_defaults(func=cmd_unmatched)
 
+    # ---- classify ----
+    p = _add_vault(sub.add_parser(
+        "classify", help="诊断分类与状态判定：平台分类认出了什么、状态压掉了什么"))
+    p.add_argument("--month", help="只统计某个月，形如 2026-09")
+    p.add_argument("--mask", action="store_true",
+                   help="商户名与平台分类原文遮蔽后输出，便于安全外发")
+    p.set_defaults(func=cmd_classify)
+
     # ---- setcat ----
     p = _add_vault(sub.add_parser(
         "setcat", help="手工指定某个商户的分类（优先级高于规则与本地 AI）"))
@@ -544,6 +812,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--apply", action="store_true",
                    help="同时改已入库的历史交易（会先备份密文）")
     p.set_defaults(func=cmd_setcat)
+
+    # ---- setsrc ----
+    p = _add_vault(sub.add_parser(
+        "setsrc", help="记住「某形状的文件是哪个渠道」，以后自动认"))
+    p.add_argument("key", nargs="?", help="形状键，如 ext:csv / zip:pdf")
+    p.add_argument("source", nargs="?", choices=list(sourcehint.KNOWN_SOURCES),
+                   help="渠道：alipay / wechat / bank_pdf / bank_ocr")
+    p.add_argument("--list", action="store_true", help="列出全部已记住的渠道")
+    p.add_argument("--clear", action="store_true", help="撤销一条记忆")
+    p.add_argument("--of", default=None,
+                   help="不记，只看这个文件的形状键是多少（排查用）")
+    p.set_defaults(func=cmd_setsrc)
 
     # ---- web ----
     p = _add_vault(sub.add_parser(

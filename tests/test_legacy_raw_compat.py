@@ -192,16 +192,36 @@ def run(tmp: str) -> int:
     import_file(bill, ledger, source="alipay", archive=False, emit=quiet)
     tables = [r[0] for r in ledger.conn.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'")]
+
+    # 「交易分类」列自 ML-011 起是**正式字段** platform_category，不再是
+    # 「报表用不到的列」—— 平台已经判好的分类比我们的关键词规则准，
+    # 整列丢掉是浪费（见 importer/platformmap.py）。
+    # 所以扫描时必须把它排除，否则这条断言测的已经不是它想测的东西。
+    # 真正要守的是：它**只**出现在 platform_category 里，不许渗进 raw。
     dump: list[str] = []
     for table in tables:
-        for row in ledger.conn.execute(f"SELECT * FROM {table}"):
+        columns = [r[1] for r in ledger.conn.execute(f"PRAGMA table_info({table})")]
+        selected = [c for c in columns if c != "platform_category"]
+        if not selected:
+            continue
+        cols_sql = ", ".join(selected)
+        for row in ledger.conn.execute(f"SELECT {cols_sql} FROM {table}"):
             dump.append(str(tuple(row)))
     blob = "\n".join(dump)
     check("扫描的表不止 txn", len(tables) >= 3, True)
     check("全库找不到对方账号标记", ACCT_MARKER in blob, False)
-    check("全库找不到交易分类标记", CAT_MARKER in blob, False)
     check("全库找不到扩展列标记", EXTRA_MARKER in blob, False)
-    check("一个标记串都没有", [m for m in MARKERS if m in blob], [])
+    check("除 platform_category 外一个标记串都没有",
+          [m for m in MARKERS if m in blob], [])
+
+    # 反过来验一次：分类原文确实被收进了那个正式字段，而不是被丢掉了
+    kept = ledger.conn.execute(
+        "SELECT platform_category FROM txn ORDER BY id LIMIT 1").fetchone()
+    check("交易分类原文被收进 platform_category（没被整列丢掉）",
+          kept["platform_category"], CAT_MARKER)
+    raw_blob = "\n".join(
+        str(tuple(r)) for r in ledger.conn.execute("SELECT raw FROM txn"))
+    check("raw 里没有交易分类标记", CAT_MARKER in raw_blob, False)
 
     print()
     print("=" * 78)

@@ -121,10 +121,20 @@ def import_file(
     """
     outcome = ImportOutcome(path=path, dry_run=dry_run)
 
-    outcome.source = source if source != "auto" else detect_source(path)
+    if source != "auto":
+        outcome.source = source
+    else:
+        # 账本开着就能读「渠道记忆」，所以自动识别会认用户指定过的形状。
+        from . import sourcehint
+        outcome.source = detect_source(path, sourcehint.hint_map(ledger))
     if outcome.source not in PARSERS:
         outcome.status = "parse_failed"
-        outcome.error = "无法识别数据源（用 --source alipay|wechat|bank_pdf 手动指定）"
+        outcome.error = (
+            "无法识别数据源。"
+            "命令行用 --source alipay|wechat|bank_pdf 指定；"
+            "网页控制台在导入页选「渠道」下拉框，"
+            "或用 setsrc 记一次，以后同类文件自动认。"
+        )
         emit(f"无法识别数据源：{path}")
         return outcome
 
@@ -267,8 +277,12 @@ def import_file(
         for item in outcome.failed_rows[:5]:
             emit(f"    第 {item['index']} 笔写入失败（{item['error_type']}）")
         emit(f"！本批状态：{outcome.status_label} —— 源文件不会被归档，补完后再跑一次即可。")
-    emit(f"分类：规则命中 {cat_stats['rules']}，缓存命中 {cat_stats['cache']}，"
+    emit(f"分类：人工指定 {cat_stats['manual']}，平台分类 {cat_stats['platform']}，"
+         f"规则命中 {cat_stats['rules']}，缓存命中 {cat_stats['cache']}，"
          f"本地 AI {cat_stats['ai']}，仍未分类 {cat_stats['unmatched']}")
+    if cat_stats["status_neutralised"]:
+        emit(f"！有 {cat_stats['status_neutralised']} 笔的状态显示这笔没真花出去"
+             f"（交易关闭 / 已退款 / 已过期等），已压成不计收支，不计入支出。")
 
     if archive and outcome.archivable:
         archived = archive_source(path, ledger, outcome.source)

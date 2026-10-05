@@ -149,8 +149,31 @@ def run(tmp: str) -> int:
     dump = "\n".join(
         str(tuple(row)) for row in ledger.conn.execute("SELECT * FROM txn"))
     check("txn 表里没有对方账号标记", ACCT_MARKER in dump, False)
-    check("txn 表里没有交易分类标记", CAT_MARKER in dump, False)
     check("txn 表里没有扩展列标记", EXTRA_MARKER in dump, False)
+
+    # 「交易分类」这一列的处置在 ML-011 变过：以前是**整列丢掉**，
+    # 现在它是 platform_category 这个正式字段（平台已经判好的分类，
+    # 比关键词规则准，见 importer/platformmap.py）。
+    #
+    # 所以标记串出现在 platform_category 里是**预期行为**，不是泄漏。
+    # 这里要守的是另一条、也是更重要的那条：它只能待在那个字段里，
+    # 不许出现在 raw、不许出现在任何别的列。
+    check("交易分类原文被存进正式字段 platform_category",
+          ledger.conn.execute(
+              "SELECT platform_category FROM txn ORDER BY id LIMIT 1"
+          ).fetchone()["platform_category"], CAT_MARKER)
+    raw_only = "\n".join(
+        str(tuple(row)) for row in
+        ledger.conn.execute("SELECT raw FROM txn"))
+    check("raw 里仍然没有交易分类标记（raw 只留白名单形态）",
+          CAT_MARKER in raw_only, False)
+    others = "\n".join(
+        str(tuple(row)) for row in ledger.conn.execute(
+            "SELECT source, txn_id, merchant_order_id, ts, amount, direction,"
+            " counterparty, item, method, status, note, category, fingerprint,"
+            " review, review_note, note FROM txn"))
+    check("除 platform_category 外没有别的列带这个标记",
+          CAT_MARKER in others, False)
 
     print()
     print("=" * 78)
