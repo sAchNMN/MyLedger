@@ -309,6 +309,80 @@ _RE_DATE = re.compile(r"^\s*(?:(\d{4})[-/.年])?(\d{1,2})[-/.月](\d{1,2})日?\s
 _RE_DATE_TOKEN = re.compile(r"(?:(\d{4})[-/.年])?(\d{1,2})[-/.月](\d{1,2})日?(?!\d)")
 _RE_TIME = re.compile(r"^\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*$")
 
+# --------------------------------------------------------------------------
+# 紧凑写法：YYYYMMDD / YYMMDD / HHMMSS
+#
+# 真实事故（用户实测的银行 PDF 探针输出）：
+#   交易行形如  20260903 | 083000 | 借 | +1234.56 | 1234.56 | ...
+#   探针统计「含日期形态的格: 0」——**一个带分隔符的日期都没有**。
+#   于是所有行走 `if not dates: continue`，整份账单解析成 0 笔。
+#
+# 为什么不能见到 8 位数字就当日期：
+#   同一份账单里还有 10 位账号、19 位卡号、以及带两位小数的金额。
+#   无脑匹配会把账号当日期，那是**静默的错**，比解析不出来危险得多。
+#
+# 所以收紧成三条硬约束（_compact_date_parts 里逐条落地）：
+#   1. 必须是**整格就是** 8 位（或 6 位）纯数字，不能是长数字里的一段
+#      ——账号 19 位、卡号 19 位、金额都因此被排除
+#   2. 年份必须在 2000–2099：银行账单不可能是 1900 年代，
+#      而流水号/账号的前 4 位撞上年份的概率极低
+#   3. 月 1–12、日 1–31 且必须是**合法日期**（闰年也对），
+#      `20261332` 这种直接否掉
+# --------------------------------------------------------------------------
+_RE_COMPACT_DATE = re.compile(r"^\d{8}$")
+_RE_COMPACT_DATE6 = re.compile(r"^\d{6}$")     # YYMMDD
+_RE_COMPACT_TIME = re.compile(r"^\d{6}$")     # HHMMSS
+
+
+def _legal_date(y: int, mo: int, d: int) -> bool:
+    """这个年月日真的存在吗（闰年也对）。"""
+    try:
+        dt.date(y, mo, d)
+        return True
+    except ValueError:
+        return False
+
+
+def _compact_date_parts(text: str) -> Optional[tuple[int, int, int]]:
+    """紧凑日期 → (年, 月, 日)。不是日期就返回 None。
+
+    刻意保守：宁可认不出（那会明确报错让人看），也不把账号当日期
+    （那是静默写坏数据）。约束见上面那段注释。
+    """
+    text = normalize_text(text)
+    if _RE_COMPACT_DATE.match(text):
+        y, mo, d = int(text[:4]), int(text[4:6]), int(text[6:8])
+        # 2000–2099：账单不可能出在 1900 年代，而 8 位数字撞上
+        # 这个年份范围又恰好月日都合法（1-12 / 1-31）的概率是
+        # 365/10000 ≈ 3.7%，而账号更长的约束已经把大头排掉了。
+        if 2000 <= y <= 2099 and _legal_date(y, mo, d):
+            return y, mo, d
+        return None
+
+    if _RE_COMPACT_DATE6.match(text):
+        yy, mo, d = int(text[:2]), int(text[2:4]), int(text[4:6])
+        y = 2000 + yy
+        if 1 <= mo <= 12 and _legal_date(y, mo, d):
+            return y, mo, d
+    return None
+
+
+def _compact_time_parts(text: str) -> Optional[tuple[int, int, int]]:
+    """紧凑时间 HHMMSS → (时, 分, 秒)。不是时间就返回 None。
+
+    同样保守：整格 6 位、且时分秒都在合法范围内。
+    `999999` 这种（探针里出现过）时分秒都越界，直接否掉 ——
+    这就是为什么它不会被误当成时间。
+    """
+    text = normalize_text(text)
+    if not _RE_COMPACT_TIME.match(text):
+        return None
+    h, mi, s = int(text[:2]), int(text[2:4]), int(text[4:6])
+    if h > 23 or mi > 59 or s > 59:
+        return None
+    return h, mi, s
+
+
 # 金额 token：**必须带两位小数**（可选货币符号 / 正负号）。
 #
 # 为什么死磕「两位小数」：这是整条银行截图链路里最强的判据。
@@ -359,13 +433,50 @@ def _extract_amounts(text: str) -> list:
 
 
 def _extract_dates(text: str) -> list:
-    """从一段文本里抠出所有日期 token，返回 [(年或None, 月, 日)]。"""
+    """从一段文本里抠出所有日期 token，返回 [(年或None, 月, 日)]。
+
+    先试带分隔符的（`2026-09-03` / `2026.09.03` / `2026年9月3日` / `09-15`），
+    **只在整格没有分隔符日期时才试紧凑写法**（`_compact_date_parts`）。
+
+    顺序不能反：账号 19 位、卡号 19 位都在这条链路上，
+    两种写法混着正则一起扫会让「先匹配到哪个」变得不确定。
+    整格判断已经足够严格，分两步走只是为了让边界更清楚。
+    """
     out = []
     for y, mo, d in _RE_DATE_TOKEN.findall(text):
         mo, d = int(mo), int(d)
         if 1 <= mo <= 12 and 1 <= d <= 31:
             out.append((int(y) if y else None, mo, d))
+    if out:
+        return out
+
+    compact = _compact_date_parts(text)
+    if compact:
+        out.append(compact)
     return out
+
+
+def _looks_like_summary_row(cells: list) -> bool:
+    """这是不是「统计区间 / 合计」这类标题行（不是交易行）。
+
+    实测踩到的：这份账单的第 4 行是
+        交易区间：20260901-20260930   合计金额：1234567.89
+    它同时有日期串和金额，形状上完全像一笔交易。如果不排除，
+    它会走完整解析流程、然后因为「区间两端都没分隔符、认不出日期」
+    落进 skipped —— 于是每次导入都报一条「没找到日期」，
+    而那条诊断**指向一个根本不需要修的东西**。
+
+    判据只看「合计 / 小计 / 统计 / 区间 / 汇总」这类词，
+    外加「整行只有一个日期」——
+    真交易行的日期必然和金额一样，是逐行重复出现的；
+    只有汇总行才会把整个区间塞进一格里。
+    """
+    blob = "".join(cells)
+    if any(k in blob for k in ("合计", "小计", "总计", "统计", "区间", "汇总")):
+        return True
+    # 「A-B」形式的日期区间（两端都是 8 位紧凑写法）
+    m = re.search(r"\d{8}\s*[-~至]\s*\d{8}", blob)
+    return m is not None
 
 
 def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
@@ -383,6 +494,12 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
     for row_no, row in enumerate(rows, start=1):
         cells = [c for c in (normalize_text(c) for c in row) if c]
         if not cells:
+            continue
+
+        # 统计区间 / 合计这类标题行：直接跳过，且**不记进 skipped**。
+        # 它不是「解析失败」，是一份账单本来就有的说明文字。
+        # 记进去会让每月的失败清单里多一条指向假问题的噪声。
+        if _looks_like_summary_row(cells):
             continue
 
         # ------------------------------------------------------------------
@@ -437,6 +554,13 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
             if m:
                 h, mi, s = m.groups()
                 time_part = (int(h), int(mi), int(s or 0))
+                break
+            # 紧凑写法 HHMMSS（`083000`）。实测这份账单里它就长这样。
+            # 注意顺序：**先判日期再判时间** —— 「20260903」也是 8 位纯数字，
+            # 不先排除它就会被当成非法时间（或反过来被当成日期）。
+            parts = _compact_time_parts(cell)
+            if parts:
+                time_part = parts
                 break
 
         # 一行出现多个两位小数时（银行流水常同时显示「金额」和「余额」）：

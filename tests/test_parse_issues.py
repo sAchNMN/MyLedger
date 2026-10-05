@@ -214,9 +214,16 @@ def run(tmp: str) -> int:
     print("0 笔：区分「文件没数据」和「规则没认出来」")
     print("=" * 78)
 
-    # B：有金额没日期（8 位紧凑写法，日期 token 认不出来）
-    compact = [["20260903", "POS消费", "商户_TEST", "-38.50", "1234.56"],
-               ["20260904", "ATM取现", "商户_TEST", "-200.00", "1034.56"]]
+    # B：有金额但日期是真认不出的写法。
+    #
+    # 这里**不能**用 8 位紧凑日期（`20260903`）当样本 ——
+    # 那个格式后来已经支持了（见 sources._compact_date_parts 与
+    # tests/test_compact_date.py），拿它当「认不出」的样本，
+    # 会让这条用例在功能修好之后反过来变成假失败。
+    # 「26/09/03」这种两位年份 + 斜杠的老式写法是真的认不出
+    # （现有正则要求 4 位年份），正好用来验「规则没认出来」这条分支。
+    compact = [["26/09/03", "POS消费", "商户_TEST", "-38.50", "1234.56"],
+               ["26/09/04", "ATM取现", "商户_TEST", "-200.00", "1034.56"]]
     res_b = _parse_bank_rows_auto(compact, "x.pdf", source="bank_pdf")
     check("B: 解析 0 笔", len(res_b.txns), 0)
     check("B: 两行都记进了 skipped（不再是静默丢弃）", len(res_b.skipped), 2)
@@ -224,7 +231,7 @@ def run(tmp: str) -> int:
           sorted({s["reason_code"] for s in res_b.skipped}), ["no_date"])
     check("B: sample 是骨架不是原文",
           res_b.skipped[0]["sample"],
-          "99999999 | aaa字字 | 字字_aaaa | -99.99 | 9999.99")
+          "99/99/99 | aaa字字 | 字字_aaaa | -99.99 | 9999.99")
     check("B: sample 里没有标记串", scan_for_markers(str(res_b.skipped)), [])
 
     # A：只有表头，没有流水行
