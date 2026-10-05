@@ -96,6 +96,13 @@ def case_status_verdict() -> None:
                   "已存入零钱", "充值完成", "已到账"):
         check(f"{value!r} 判为已完成", status_verdict(value), STATUS_OK)
 
+    # 「已收钱」是 2026-10-05 在真实账本里发现的状态值：
+    # 微信转账收款完成后就是这个词。认不出来会让这笔一直挂在诊断的
+    # 「谜题」列表里，而它对方向的处理（不压）和 unknown 完全一样。
+    check("'已收钱' 判为已完成", status_verdict("已收钱"), STATUS_OK)
+    check("'已收钱' 不压支出（和 unknown 一个效果）",
+          status_verdict("已收钱") in STATUS_KILLS_EXPENSE, False)
+
     # 这些是「没花出去」
     for value in ("交易关闭", "已关闭", "交易取消", "已取消", "支付失败",
                   "已过期", "订单已关闭"):
