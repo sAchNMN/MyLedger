@@ -301,11 +301,35 @@ def _parse_rows(
     origin: str,
 ) -> ParseResult:
     """通用解析流程：找表头 → 按列名取值 → 校验 → 产出 Txn。"""
-    header_row = find_header_row(rows)
+    # 把 aliases 传进去：表头认不出来时，让「这一行能认出几个字段」
+    # 也成为判据。银行 PDF 的列名叫法千差万别，只认 6 个锚点词太窄
+    # （实测「日期|时间|摘要|发生额」这种表头会被判成「文件里没有表头」，
+    #  而文件明明有表头 —— 那个报错方向是错的）。
+    header_row = find_header_row(rows, aliases=aliases)
     if header_row is None:
+        # 认不出表头**不等于**文件里没有表头 —— 更可能是这次的列名叫法
+        # 没见过。直接报 missing_header 会让用户以为导出坏了。
+        # 退一步：无表头自动识别（靠「整格有日期 + 整格有两位小数金额」认行）。
+        # 它能救回大部分流水；救不回时 `_parse_bank_rows_auto` 会在
+        # skipped 里留下「有金额没日期」这类可诊断的线索。
+        result = _parse_bank_rows_auto(
+            rows, path, origin=origin, encoding=encoding, source=source)
+        if result.txns:
+            return result
+        # 连无表头也认不出来：把两条线索都说清楚，别只丢一个 missing_header
+        skipped = list(result.skipped) or [
+            {"row": 0, "reason_code": "missing_header"}]
+        skipped.insert(0, {
+            "row": 0,
+            "reason_code": "missing_header",
+            "reason": "这份文件的列名没见过，既认不出表头、"
+                      "也没法按内容自动识别出交易行。"
+                      "用 scripts\\bank-pdf-columns.py 打出脱敏结构"
+                      "（可安全外发），照着列名加进对应渠道的别名表即可。",
+        })
         return ParseResult(
             source=source, txns=[], declared_count=extract_declared_count(rows),
-            skipped=[{"row": 0, "reason_code": "missing_header"}], path=path,
+            skipped=skipped, path=path,
         )
 
     header = header_names(rows[header_row])
@@ -314,15 +338,34 @@ def _parse_rows(
     # 报表也看不出来），详见函数注释。
     index = _fix_amount_vs_balance_column(index, header)
 
-    # 必需字段缺失就直接失败，不要产出半成品账单
+    # 必需字段缺失就退回自动识别，而不是直接失败。
+    #
+    # 实测踩到：一份表头叫「交易日期 | 交易时间 | 交易摘要 | 交易金额」
+    # （只有 4 列、列名全是 2-4 个字）的 PDF 账单，
+    # 别名表认不出 amount -> 直接报 missing_required_column -> 整份 0 笔。
+    # 而那份文件里明明有 3 笔正常交易，无表头识别能全部捞出来。
+    #
+    # 为什么不直接失败：列名是银行印的，改版我们管不了；
+    # 「认不出列名」不等于「数据有问题」。只要行里有日期和金额就该认出来 ——
+    # 真的认不出来时，报错里会明确说两条路都试过了，并给出加别名的指引。
     missing = [f for f in ("ts", "amount") if f not in index]
     if missing:
+        fallback = _parse_bank_rows_auto(
+            rows, path, origin=origin, encoding=encoding, source=source)
+        if fallback.txns:
+            return fallback
         return ParseResult(
-            source=source, txns=[], declared_count=extract_declared_count(rows),
+            source=source, txns=[],
+            declared_count=extract_declared_count(rows),
             skipped=[{
                 "row": header_row + 1,
                 "reason_code": "missing_required_column",
                 "fields": missing,
+                "reason": f"表头里认不出「{'、'.join(missing)}」这两列，"
+                          "无表头自动识别也没认出交易行。"
+                          "大概率是这份文件的列名第一次见。"
+                          "用 scripts\\bank-pdf-columns.py 打出脱敏结构"
+                          "（可安全外发），把列名加进别名表就能支持。",
             }],
             path=path,
         )
@@ -958,11 +1001,12 @@ def parse_bank_pdf(path: str, password: Optional[str] = None) -> ParseResult:
     # source 必须一路传下去。之前只在结果对象上改 source，
     # 每笔 Txn 还是写死的 "bank_ocr" —— 界面和报表读的是 Txn.source，
     # 于是 PDF 导入的数据被显示成「银行卡截图」。
-    result = _parse_rows(rows, BANK_PDF_ALIASES, "bank_pdf", path, "pdf", origin)
-    if result.txns:
-        return result
-    # 没有表头（部分银行导出的是纯流水，没有列名行）
-    return _parse_bank_rows_auto(rows, path, origin=origin, source="bank_pdf")
+    #
+    # `_parse_rows` 内部已经会做两件事，所以这里**不需要**再兜一次：
+    #   · 认不出表头    -> 退回无表头自动识别
+    #   · 认不出必需列  -> 退回无表头自动识别
+    # 两条兜底路径都在它里面，且失败时会留下可诊断的 skipped 线索。
+    return _parse_rows(rows, BANK_PDF_ALIASES, "bank_pdf", path, "pdf", origin)
 
 
 # --------------------------------------------------------------------------

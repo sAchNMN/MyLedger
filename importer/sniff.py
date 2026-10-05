@@ -28,6 +28,27 @@ from .model import normalize_text, parse_excel_serial
 # 表头必须至少命中其中一个，否则不认为是表头行
 HEADER_ANCHORS = ("交易时间", "交易号", "交易单号", "交易订单号", "金额", "收/支")
 
+# 判定「这一行像表头」的**弱信号**词。
+#
+# 为什么需要它们（实测踩到）：
+#   原来只认 HEADER_ANCHORS 那 6 个词，于是下面这些表头**全部认不出来**
+#   （find_header_row 返回 None → 整份文件解析 0 笔 + 报 missing_header）：
+#     日期 | 时间 | 摘要 | 发生额 | 余额 | 对方户名 | 流水号 | 渠道 | 附言
+#     交易日期 | 交易时间 | 交易摘要 | 交易金额            （只有 4 列）
+#     交易日期 | 交易金额 | 对方户名                      （只有 3 列）
+#   原因是那些词太短（2 个字），而 `min_fields=5` + 「命中 2 个锚点」
+#   把它挡在门外了。银行 PDF 的表头叫法千差万别，不能只认一种。
+#
+# 下面这些是**列名里高频出现**的词，命中它们说明「这一行是一排列名」
+# 而不是「这是一句话」。它们单独不够（说明文字里也会有），
+# 必须配合「多数格子短且互不相同」这个条件。
+_HEADER_LIKE_WORDS = (
+    "日期", "时间", "金额", "对方", "摘要", "类型", "状态", "备注", "附言",
+    "用途", "渠道", "方式", "余额", "发生额", "笔数", "序号", "卡号",
+    "账户", "户名", "姓名", "编号", "单号", "流水", "标志", "方向",
+    "交易", "明细", "商品", "名称", "分类", "商户",
+)
+
 # 文件里自述笔数的写法：「共119笔记录」「共87笔记录」
 DECLARED_COUNT_RE = re.compile(r"共\s*(\d+)\s*笔")
 
@@ -291,13 +312,39 @@ def extract_declared_count(rows: list[list[str]]) -> Optional[int]:
     return None
 
 
-def find_header_row(rows: list[list[str]], min_fields: int = 5) -> Optional[int]:
-    """定位表头行。
+def find_header_row(rows: list[list[str]], min_fields: int = 5,
+                    aliases: Optional[dict] = None) -> Optional[int]:
+    """定位表头行。返回行号，找不到返回 None。
 
-    判据：这一行的非空字段数 >= min_fields，且至少命中 2 个表头锚点词。
-    要求命中 2 个而不是 1 个，是因为说明文字里也可能出现「金额」这种词
-    （例如「收入：27笔 1234元」），单个关键词容易误判。
+    三级判据（从严到宽依次尝试）
+    --------------------------
+    1. **锚点词**（最严）：非空字段 >= min_fields，且命中 >= 2 个
+       `HEADER_ANCHORS`。要求 2 个而不是 1 个，是因为说明文字里也会出现
+       「金额」（例如「收入：27笔 1234元」），单个关键词容易误判。
+
+    2. **别名表**（给了 aliases 时）：这一行按别名表能认出 >= 2 个字段。
+       这是**最可靠的宽判据** —— 别名表里有「交易日期/日期/记账日期/
+       入账日期」等一整串同义写法，无论银行怎么叫都认得出。
+       不需要猜「像不像列名」。
+
+    3. **弱信号词 + 形状**（最宽）：命中 >= 2 个 `_HEADER_LIKE_WORDS`，
+       且这一行**多数格子短且互不相同**（表头的特征）。
+       「短且互不相同」是关键 —— 说明文字「收入：27笔 1234元」只有一格，
+       而表头是「交易日期」「交易时间」这样一堆 2-4 字的短词。
+
+       加上「互不相同」是因为像
+       `**********  **********  **********`（掩码后的账号）这种行
+       长度一样、内容重复，是数据行不是表头。
+
+    为什么要三级：实测的失败几乎都是「表头认不出来 → 整份文件 0 笔」，
+    而报的是 `missing_header`（指向「文件里没有表头」）——
+    实际文件**有**表头，只是叫法没被认出来。
+    那个报错方向是错的，会让人以为导出坏了。
     """
+    if not rows:
+        return None
+
+    # ---- 1. 锚点词 ----
     for i, row in enumerate(rows[:60]):
         cells = [c for c in row if c]
         if len(cells) < min_fields:
@@ -306,6 +353,72 @@ def find_header_row(rows: list[list[str]], min_fields: int = 5) -> Optional[int]
         hits = sum(1 for anchor in HEADER_ANCHORS if anchor in joined)
         if hits >= 2:
             return i
+
+    # ---- 2. 别名表 ----
+    if aliases:
+        for i, row in enumerate(rows[:60]):
+            cells = [c for c in row if c]
+            if len(cells) < 2:
+                continue
+            named = [c for c in cells if _matches_any_alias(c, aliases)]
+            if len(named) >= 2:
+                return i
+
+    # ---- 3. 弱信号词 + 形状 ----
+    for i, row in enumerate(rows[:60]):
+        cells = [c for c in row if c and c.strip()]
+        if len(cells) < 2:
+            continue
+        joined = "".join(cells)
+        hits = sum(1 for w in _HEADER_LIKE_WORDS if w in joined)
+        if hits < 2:
+            continue
+        # 形状判据：多数格子是短词（<= 6 字），且不重复
+        short = [c for c in cells if len(c) <= 6]
+        if len(short) < max(2, len(cells) * 0.6):
+            continue
+        if len(set(short)) < len(short) * 0.8:
+            continue        # 大量重复 -> 是数据行（账号/金额序列），不是表头
+        return i
+
+    return None
+
+
+def _matches_any_alias(text: str, aliases: dict) -> bool:
+    """这个格子像不像某个字段的列名。
+
+    刻意要求**基本相等或互为前缀/后缀的短词**，而不是随便包含。
+    实测踩到的误判：
+
+        ['户名：TEST', '币种：人民币', '起止日期：2026-09-01～2026-09-30',
+         '账户：ACCT-TEST-001', '电子流水号：LOG-TEST-001']
+
+    这一行是账户信息，**不是表头**，但按「子串包含」判：
+        '起止日期：2026-09-01～2026-09-30'  含 '日期'   -> 算命中
+        '电子流水号：LOG-TEST-001'            含 '流水号' -> 算命中
+    两个就够「>= 2」，于是这行被当成表头 —— 而它后面一行才是真表头，
+    真表头反而被跳过（`find_header_row` 只返回第一个命中）。
+
+    修法：**带分隔符的「键：值」形式直接否掉**。
+    列名是「交易日期」，不长这样；「起止日期：2026-09-01」是数据。
+    """
+    t = normalize_text(text)
+    if not t:
+        return False
+    # 「键：值」形态是数据行（账户信息、说明文字），不是列名。
+    # 全角冒号也认 —— 银行 PDF 里两种都有。
+    for sep in ("：", ":"):
+        if sep in t:
+            return False
+    for names in aliases.values():
+        for n in names:
+            if t == n:
+                return True
+            # 「交易日期明细」这种带后缀的也算，但要求**短**——
+            # 太长的匹配基本不会是列名。
+            if len(n) >= 3 and (t.startswith(n) or t.endswith(n)) and len(t) <= 8:
+                return True
+    return False
     return None
 
 
