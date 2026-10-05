@@ -109,6 +109,63 @@ SQLite（在 vault 里，仓库外）→ 月报
 
 ---
 
+## 1b. 两种 zip 加密：标准库解得了的那种，和解不了的那种
+
+**zip 加密有两种，完全不是一回事：**
+
+| 加密方式 | 谁在用 | Python 3.13 的 `zipfile` |
+|---|---|---|
+| **传统 ZipCrypto**（PKWARE） | 支付宝/微信导出的 zip | ✅ 能解 |
+| **WinZip AES-128/192/256** | **实测某家银行寄来的账单** | ❌ **解不了** |
+
+识别方式（只读中央目录，不解压不碰内容）：
+
+- 条目的 `compress_type == 99` → WinZip AES（那个 99 是「AES 加密」标记，不是压缩方法）
+- extra 字段里有 `0x9901` → 同一件事，强度在**第 8 个字节**（1/2/3 = 128/192/256）
+- 否则是传统 ZipCrypto
+
+CPython **3.14** 才给 `zipfile` 加了 AES 支持，本机是 3.13，所以只能绕。
+
+### 这次踩的坑
+
+用户密码输对了，程序还是报「压缩包解不开：需要密码，或给定密码不对」。
+两个问题叠在一起：
+
+1. **`zipfile` 遇到 AES 包抛的是 `NotImplementedError` / 一句含糊的
+   「Bad password」。** 后者把「**算法不支持**」说成了「**密码不对**」——
+   用户输一百遍正确密码都解不开，最后开始怀疑自己记错了密码。
+   这是本项目最忌讳的那类错误：**报错指向的原因和真实原因不是一回事。**
+2. **「压缩包 None」是个真 bug。** 报错文案里带的是 `zf.filename`，
+   而 `open_document` 用 `zipfile.ZipFile(io.BytesIO(data))` 构造，
+   那个属性是个 BytesIO 对象，打印出来是地址或 `None`——
+   一句报错里出现了不该出现的 `None`，让人以为程序自己出错了。
+
+### 现在的行为
+
+```
+读一个 zip
+  ├─ 不加密 / 传统 ZipCrypto  →  标准库直接解（主路径，不动）
+  └─ WinZip AES              →  调本机 7-Zip（7z.exe）
+        ├─ 找到了 → 用它解
+        └─ 没找到 → 明确告诉用户：装 7-Zip，或自己拖出 PDF 丢进投递目录
+```
+
+**密码怎么传给 7-Zip，这是个明确的取舍。**
+7-Zip **不读 stdin**（实测：`-p` 不带值走管道会产出 0 字节文件并报
+「Sub items Errors」），它只在交互式控制台里提示输入。所以密码只能放在
+命令行 `-p<pwd>` 里，**同机其他进程用 `tasklist` / `wmic` 看得到**。
+
+接受这个代价的理由：本程序是单机单用户的本地隐私工具，不跑在共享机器上；
+窗口创建时立刻隐藏（`CREATE_NO_WINDOW`），密码不落盘、不进日志、
+用完即丢。替代方案（让用户自己用 7-Zip 解压再丢 PDF）是把每月都要做的
+麻烦推给用户，还会让「全自动」这条线断掉。真要更严，得上 `py7zr` 之类的
+第三方库绑定 —— 那是另一个取舍，本项目不在加密相关的地方引入第三方依赖。
+
+**一句话记住**：AES 包在 3.13 上必须靠外部工具，这是环境限制，不是 bug；
+能做的是**别把「我解不了」说成「你密码错了」**。
+
+---
+
 ## 2. 为什么按列名匹配而不是按列号
 
 两家平台的导出格式每隔一两年就会改一次。如果代码写死「金额在第 6 列」，改版后不会报错，只会把金额读到备注列上——**静默的错误比报错危险一个数量级**。
@@ -298,6 +355,7 @@ Desktop\MyLedger\                      ← Git 仓库，只有代码
 ├── importer\
 │   ├── model.py       统一交易模型
 │   ├── sniff.py       编码/表头嗅探（含压缩包解包、xlsx 解析）
+│   ├── archive.py     zip 解密：标准库优先，WinZip AES 降级到 7-Zip
 │   ├── sources.py     支付宝/微信/银行 的适配器与字段识别
 │   ├── bank_pdf.py    加密 PDF 抽取（PyMuPDF，按坐标还原行与列）
 │   ├── pipeline.py    单文件导入流水线（cli 与 monthly 共用）
@@ -345,6 +403,9 @@ python -m importer ocr <图片...>
 
 # PDF 结构探针（换银行时先跑这个，输出全部脱敏，可安全外发）
 <venv>\Scripts\python.exe scripts\bank-pdf-probe.py "账单.pdf"
+
+# 查一个 zip 用的什么加密（只读中央目录，不碰内容）
+<venv>\Scripts\python.exe -c "from importer import archive; print(archive.describe_encryption(r'<文件>.zip'))"
 
 # 所有命令都支持 --vault <目录> 指定 vault 位置（默认 %USERPROFILE%\MyLedgerVault）
 ```
@@ -589,6 +650,12 @@ python -m importer review --ui
 | 跨渠道重复（支付宝 vs 微信） | 标记为疑似，reason 写明双方来源 |
 | 残缺文件（只有表头） | **拒绝导入，退出码 2，不写库** |
 | 密码错误的 zip | 报错清晰，指出需要 `--password` |
+| **WinZip AES-256 zip 自动识别** | `compress_type=99` + extra `0x9901` 认出，强度读作 AES-256 |
+| **AES 包自动降级到 7-Zip** | 密码对时真解出 PDF 字节（808 B），解析出表头 + 3 行流水；约 490 ms |
+| **传统 ZipCrypto 主路径未被破坏** | 仍走标准库（不为了 AES 把主路径改坏），内容与原始字节一致 |
+| **报错不再误报「密码不对」** | AES 包 + 错密码 → 报 `ArchiveError`，含「WinZip AES」与可操作的下一步；无「压缩包 None」 |
+| **缺 7-Zip 时的提示** | 说清「装 7-Zip」与「手动拖出 PDF」两条路，不把锅甩给密码 |
+| 全部 20 套测试 | 全过 |
 | 分类规则 | 餐饮/交通/日用百货/转账还款/退款 均正确 |
 | 人工裁定 `--resolve` | 生效，报表实时反映 |
 | 纯标准库 | `compileall` 通过，无第三方依赖 |
@@ -662,6 +729,30 @@ python -m importer review --ui
    修法：`check_same_thread=False` + 一把锁守住所有账本操作。
 8. 去掉了「保存 zip 密码」的全部代码路径——**不给的能力就不会被误用**。
 
+*第四批（WinZip AES）*
+
+9. **「压缩包 None 解不开：需要密码，或给定密码不对」——两个 bug 叠在一起。**
+   用户密码输对了还是失败。真实原因：那个包是 **WinZip AES-256** 加密，
+   Python 3.13 的 `zipfile` 只支持传统 ZipCrypto，解不了时抛的是一句
+   含糊的「Bad password」——**把「算法不支持」误报成「密码不对」**。
+   用户输一百遍正确密码都解不开，最后开始怀疑自己记错了密码。
+   而 `None` 是另一处 bug：报错文案带的是 `zf.filename`，
+   `open_document` 用 `ZipFile(io.BytesIO(data))` 构造，那是个 BytesIO 对象。
+   修法：新增 `importer/archive.py`，AES 包自动降级调本机 7-Zip；
+   `ArchiveError` 不再被包成「取不出 PDF」，直接上抛。
+
+*第五批（渠道识别、zip 装 PDF）*
+
+10. 银行寄来的账单是「一个装着加密 PDF 的 zip」，文件名是 `26100501103672708650.zip`
+    这种流水号。`detect_source` 只认文件名关键词和 CSV 表头，
+    流水号文件名两样都不沾，必然认不出渠道。
+    就算手动 `--source bank_pdf`，`bank_pdf.extract_rows` 会把 zip
+    直接扔给 `pymupdf.open()` —— 实测它**不报错**，而是安静地开出一个
+    0 页的空文档，于是后面走到「抽不到文字层」，被误判成扫描件。
+    修法：`sniff.open_document(path, password, suffixes)` 抽出统一的
+    「读源文件」逻辑，表格链路和 PDF 链路各传自己的后缀。
+    渠道记忆（手动指定一次以后自动认）见 `tests/test_source_hint.py`。
+
 ---
 
 ## 9. 明确不采用的做法
@@ -679,3 +770,7 @@ python -m importer review --ui
 | **自己写 AES 加密数据库** | 密钥还是得存在同一台机器上，等于没加密。用系统提供的 DPAPI |
 | **运行时解密数据库到临时文件** | 会在硬盘上留下明文副本，恰好是要防的东西。改成全程内存 |
 | 把 review 界面做成需要联网的网页 | 只绑 127.0.0.1、不引外部资源、不落文件 |
+| **用 pyzipper / py7zr 解 AES zip** | 加密相关的地方引入第三方依赖，是这个项目最不该开的口子。AES 只在极少数银行遇到，走 7-Zip 降级即可 |
+| **把 AES 解不开说成「密码不对」** | 报错指向的原因必须和真实原因一致。「我解不了」和「你密码错了」是两件事，用户会照着错的方向反复试 |
+| **要求用户每次自己先解压 zip** | 能自动的就别让人动手。每月一次的麻烦也是麻烦 |
+| **在 AES 包上先试标准库再放弃** | 已知是 AES 就别浪费时间试，标准库只留给传统 ZipCrypto 这条主路径 |

@@ -22,6 +22,7 @@ import zipfile
 from datetime import datetime
 from typing import Optional
 
+from . import archive
 from .model import normalize_text, parse_excel_serial
 
 # 表头必须至少命中其中一个，否则不认为是表头行
@@ -82,11 +83,31 @@ TABLE_SUFFIXES = (".csv", ".txt", ".xlsx", ".xlsm")
 DOCUMENT_SUFFIXES = TABLE_SUFFIXES + (".tsv", ".pdf")
 
 
-def _read_from_zip(zf, names: list, password: Optional[str]) -> tuple[bytes, str]:
+def _read_from_zip(path: str, zf, names: list,
+                   password: Optional[str]) -> tuple[bytes, str]:
     """从压缩包里取出第一份能读出来的文档。返回 (字节, 包内路径)。
 
-    先试用户给的密码，再试无密码（有些包不加密）。
+    **WinZip AES 的包自动降级到 7-Zip**（见 archive.py）。
+
+    为什么必须有这条降级路：实测真有一家银行导出的账单是 AES-256 加密，
+    `zipfile` 在 Python 3.13 上完全解不了，而它抛的是一句含糊的
+    「Bad password」——把「算法不支持」误报成「密码不对」。
+    用户于是反复重输正确密码，永远解不开，最后开始怀疑自己记错了密码。
+    报错必须指向真实原因，这是本项目不可违背的一条。
     """
+    try:
+        return archive.extract_member(path, names, password)
+    except archive.ArchiveError:
+        raise
+    except Exception:
+        # archive 模块自己都崩了（不该发生）——退到标准库，
+        # 至少保住「传统 ZipCrypto」这条主路径。
+        return _read_from_zip_stdlib(zf, names, password)
+
+
+def _read_from_zip_stdlib(zf, names: list,
+                          password: Optional[str]) -> tuple[bytes, str]:
+    """纯标准库解法。密码错时按老规矩报错。"""
     passwords: list[Optional[bytes]] = []
     if password:
         passwords.append(password.encode("utf-8"))
@@ -143,7 +164,9 @@ def open_document(path: str, password: Optional[str] = None,
         wanted = "/".join(suffixes)
         raise ValueError(f"压缩包 {os.path.basename(path)} 里没有找到 {wanted} 文件")
 
-    content, name = _read_from_zip(zf, candidates, password)
+    # 传 path 而不是 zf：AES 包要调 7-Zip，它需要的是真实文件路径。
+    # zf.filename 在这里是那个 BytesIO 对象，不是路径。
+    content, name = _read_from_zip(path, zf, candidates, password)
     return content, f"压缩包内 {name}"
 
 

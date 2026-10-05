@@ -141,9 +141,15 @@ def extract_rows(path: str, password: Optional[str] = None) -> tuple[list[list[s
         raise PdfError(f"找不到文件：{path}")
 
     if zipfile.is_zipfile(path):
+        from .archive import ArchiveError
         from .sniff import open_document
         try:
             data, origin = open_document(path, password, (".pdf",))
+        except ArchiveError:
+            # 这一类错误信息本身已经很完整（写清了真实加密方式），
+            # 再包一层只会把它埋掉。上游写「压缩包 None 解不开」
+            # 就是这么来的 —— None 是 zf.filename，它是个 BytesIO。
+            raise
         except Exception as exc:
             raise PdfError(
                 f"这个压缩包里取不出 PDF：{exc}\n"
