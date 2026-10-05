@@ -35,11 +35,63 @@ set -uo pipefail
 
 BYPASS="${MYLEDGER_ALLOW_SENSITIVE:-}"
 FOUND=0
+HITS=0
 REPORT=""
 
 note() {
   REPORT="${REPORT}  [拦截] $1"$'\n'
   FOUND=1
+  HITS=$((HITS + 1))
+}
+
+# --------------------------------------------------------------------------
+# 绕过留痕（ML-003）
+#
+# 为什么要有这一步：绕过变量是唯一保留的紧急通道，但它原本**不留任何痕迹** ——
+# 事后完全无法回答「绕过过几次、当时提交了什么」。一次绕过可能是应急，
+# 次次绕过就是防线失效，而用户在两种情况下看到的东西是一样的。
+#
+# 所以绕过时写一条结构化日志，放在**不会被提交**的地方。
+# 位置三级兜底：项目里的 .workbuddy/（gitignore 已覆盖）→ 用户目录 → .git。
+# .git 一定能写（否则这次提交根本没法发生），保证至少有一处留下记录。
+#
+# 全程只用 shell 内置命令 + git：
+#   时间戳用 Bash 内置的 printf %(...)T，不用外部 date；
+#   mkdir 找不到命令时 if 会走假分支，不会中断钩子。
+#   写日志失败也绝对不能挡住提交 —— 它是「记录」，不是「放行条件」。
+# --------------------------------------------------------------------------
+log_bypass() {
+  _ts=$(printf '%(%Y-%m-%dT%H:%M:%S%z)T' -1 2>/dev/null)
+  [ -z "$_ts" ] && _ts="unknown-time"
+
+  _who=$(git config user.name 2>/dev/null) || _who="unknown"
+  [ -z "$_who" ] && _who="unknown"
+  _mail=$(git config user.email 2>/dev/null) || _mail="unknown"
+  [ -z "$_mail" ] && _mail="unknown"
+  _branch=$(git symbolic-ref --short HEAD 2>/dev/null) || _branch="unknown"
+  [ -z "$_branch" ] && _branch="unknown"
+
+  _log=""
+  for _dir in ".workbuddy/audit" "${HOME:-}/.MyLedger/audit" ".git"; do
+    if mkdir -p "$_dir" 2>/dev/null && [ -d "$_dir" ]; then
+      _log="$_dir/gate-bypass.log"
+      break
+    fi
+  done
+
+  if [ -z "$_log" ]; then
+    echo "  （没能写下绕过记录：三个位置都不可写。这次绕过没有留下痕迹。）"
+    return 0
+  fi
+
+  {
+    printf '%s\tbypass-commit\tbranch=%s\tuser=%s <%s>\thits=%d\n' \
+           "$_ts" "$_branch" "$_who" "$_mail" "$HITS"
+    printf '%s' "$REPORT"
+  } >> "$_log" 2>/dev/null || true
+
+  echo "已记录：$_log"
+  echo "（这个文件不在 Git 仓库里，也不会被推送 —— 想留多久留多久。）"
 }
 
 is_exempt() {
@@ -134,6 +186,10 @@ if [ "$FOUND" -ne 0 ]; then
     echo "警告：已通过 MYLEDGER_ALLOW_SENSITIVE 绕过提交闸门。"
     echo "以下内容将永久写入 Git 历史，删除文件无法撤回："
     printf '%s' "$REPORT"
+    echo ""
+    echo "这次绕过会被记下来（审计用，不是为了追责，是为了以后能查）："
+    log_bypass
+    echo ""
     echo "继续提交。"
     exit 0
   fi
