@@ -18,8 +18,10 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sqlite3
+import tempfile
 from collections import Counter
 from datetime import datetime
 from typing import Callable, Optional
@@ -337,12 +339,99 @@ def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
     return {"changed": len(changes), "applied": True}
 
 
-def backup(path: str, emit: Callable[[str], None] = print) -> str:
-    """写库前先备份密文。备份失败就不动手。"""
+# --------------------------------------------------------------------------
+# 写库前备份，以及旧备份的轮转
+#
+# 每次写库留一份 `ledger.db.enc.backup-<时间戳>`，原本从不清理 ——
+# 实测一天堆到 15 份（4.8 MB），而且跑一次 CLI 就再长一份。
+# 手工清一次没用，所以清理必须挂在每次备份之后自动发生。
+# --------------------------------------------------------------------------
+
+# 保留最近几份。留多了没意义：这东西是「上一次写库之前」的快照，
+# 回滚最多退一步，不需要留一周的历史。
+BACKUP_KEEP = 3
+
+
+def _rotation_dir() -> str:
+    """旧备份的去处。放在系统临时目录，由 Windows 自己回收。"""
+    folder = os.path.join(tempfile.gettempdir(), "MyLedger-backup-rotation")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def rotate_backups(path: str, keep: int = BACKUP_KEEP,
+                   emit: Callable[[str], None] = print) -> list[str]:
+    """把超过 `keep` 份的旧备份移出 vault，返回被轮出的文件名。
+
+    时间戳后缀是 `%Y%m%d-%H%M%S`，字典序等于时间序，所以直接排序，
+    不需要读文件的修改时间。
+
+    为什么是「移动」而不是「删」：本项目的纪律是移动代替删除，
+    vault 里的东西尤其如此 —— 一旦误删就没有第二次机会。
+    `%TEMP%` 会被 Windows 存储感知 / 磁盘清理自动回收，
+    代价只是临时占一点空间，换来的是「手滑之后还能翻回来」。
+    """
+    if keep is None or keep < 1:
+        return []
+    folder = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + ".backup-"
+    try:
+        names = sorted(n for n in os.listdir(folder) if n.startswith(prefix))
+    except OSError:
+        return []                            # 目录读不了就什么都不做，别挡写库
+
+    stale = names[:max(0, len(names) - keep)]
+    if not stale:
+        return []
+    try:
+        target_dir = _rotation_dir()         # 确实要挪了才建这个目录
+    except OSError as exc:
+        emit(f"  （临时目录不可用，跳过轮转：{type(exc).__name__}）")
+        return []
+    moved: list[str] = []
+    for name in stale:
+        try:
+            dst = os.path.join(target_dir, name)
+            if os.path.exists(dst):          # 同名先清，否则 move 会撞
+                os.remove(dst)
+            shutil.move(os.path.join(folder, name), dst)
+            moved.append(name)
+        except OSError as exc:
+            # 单个文件移不动（比如还被 7-Zip 占着）不代表别的也移不动，
+            # 继续处理剩下的，最后如实汇报。
+            emit(f"  （旧备份 {name} 没挪走：{exc.strerror or type(exc).__name__}）")
+    return moved
+
+
+def backup(path: str, emit: Callable[[str], None] = print,
+           keep: int = BACKUP_KEEP) -> str:
+    """写库前先备份密文。备份失败就不动手。
+
+    顺带把更早的备份轮出 vault —— 每次写库留一份、从不清理，
+    实测一天堆到 15 份。手工删一次没用，下一次跑 CLI 又长回来，
+    所以清理必须是每次执行的动作，而不是记得才做的事。
+
+    keep 传 0 表示不轮转（只备份，永远保留）。
+    """
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     target = f"{path}.backup-{stamp}"
     shutil.copy2(path, target)
     emit(f"已备份到 {target}")
+
+    # 轮转是善后，**它的失败绝不能阻断已经成功的写库**。
+    # 备份已经落地了，轮不动最多是旧文件多占点地方，
+    # 而在这里抛异常会让用户以为写库失败、重跑一次又把数据搞得更乱。
+    moved: list[str] = []
+    rotated_to = ""
+    try:
+        moved = rotate_backups(path, keep=keep, emit=emit)
+        if moved:
+            rotated_to = _rotation_dir()
+    except Exception as exc:                 # noqa: BLE001 - 兜住一切，见上面
+        emit(f"  （旧备份轮转跳过：{type(exc).__name__}: {exc}）")
+        return target
+    if moved and rotated_to:
+        emit(f"  已轮出 {len(moved)} 份更早的备份 → {rotated_to}")
     return target
 
 
