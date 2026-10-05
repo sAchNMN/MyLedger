@@ -68,6 +68,11 @@ REM    浏览器会自动打开本地控制台 http://127.0.0.1:<随机端口>/?
 网页控制台覆盖日常，命令行用于批处理与补救。
 
 ```bat
+REM 未分类商户：先看一眼建议，逐条拍板（推荐，比手敲 setcat 快很多）
+python -m importer suggest            REM 逐条确认，回车采纳
+python -m importer suggest --list     REM 只列建议，不进确认
+python -m importer suggest --ai       REM 本地没依据时让本机模型补一个（需装 Ollama）
+
 REM 单文件导入
 python -m importer import 账单.csv
 
