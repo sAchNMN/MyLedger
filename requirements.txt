@@ -1,0 +1,30 @@
+# ===========================================================================
+# MyLedger dependencies
+#
+# Why this list is one line long: the whole tool is written against the
+# Python standard library on purpose. XLSX is parsed by hand in
+# importer/sniff.py precisely so that openpyxl never has to be pulled in.
+#
+# PyMuPDF is the ONLY exception, and there is exactly one reason for it:
+# bank statements arrive as PDFs laid out with positioned text. Recovering
+# rows and columns requires word coordinates, and nothing in the standard
+# library can give you those. Every other PDF need would have stayed home.
+# See docs/HANDOVER.md 5.8.
+#
+# Version floor: 1.28 is what everything here has been tested against,
+# including the encrypted-PDF path and the zip-that-contains-a-PDF path.
+# ===========================================================================
+
+pymupdf>=1.28.2
+
+# Everything below is NOT a dependency - do not add these lines back.
+#
+# openpyxl  - rejected. Needed only for XLSX reading, which importer/sniff.py
+#             already does with zipfile + xml.etree. Adding it would put a
+#             third-party package on the only path that handles WeChat bills.
+# pandas    - rejected. Same story, plus it would drag a C build onto machines
+#             that only need to import one CSV a month.
+# pytest    - not used. Tests are standalone scripts with exit codes so they
+#             can run without anything installed. See README "开发".
+# requests  - rejected, and it is not just taste: this tool is offline by
+#             design. http.server from the stdlib is all the HTTP we do.
