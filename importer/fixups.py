@@ -292,10 +292,17 @@ def apply_manual(ledger: Ledger, merchant: str, category: Optional[str] = None,
 
     # 归一化比较只能放在 Python 里做：SQLite 没有 normalize_text，
     # 而商户名可能有全角/多余空白这类差异。账本规模（几千笔以内）下这样最稳。
+    #
+    # 排除已确认的重复笔：那是一条「已经判定为重复、不参与统计」的记录，
+    # 给它归类是白费功夫 —— 所有汇总口径都把它剔掉了，改了也看不出变化，
+    # 只在「撤销人工指定」时会变成一条没人认领的空改动。
+    # 这里必须和 store 里那些 WHERE 用同一套过滤，否则「改了 N 笔」
+    # 和界面上看到的数字永远差那么一两笔。
     rows = [
         r for r in ledger.conn.execute(
             "SELECT id, source, direction, category, counterparty, item, amount,"
             " status, platform_category, raw FROM txn"
+            " WHERE review != 'confirmed_dup'"
         ).fetchall()
         if normalize_text(r["counterparty"]) == key
     ]

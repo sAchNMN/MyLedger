@@ -261,8 +261,33 @@ def case_unmatched_aggregation() -> None:
     check("查一个没有数据的月份返回空", rows, [])
 
 
+def case_apply_manual_skips_confirmed_dup() -> None:
+    section("9. apply_manual 不碰已确认的重复笔")
+    led = fresh_ledger()
+    ingest(led, counterparty=UNMATCHED_A, amount="10.00")
+    dup = ingest(led, counterparty=UNMATCHED_A, amount="10.00")
+    # Txn 对象上没有 id（那是入库时数据库给的），按 txn_id 反查。
+    dup_id = led.conn.execute(
+        "SELECT id FROM txn WHERE txn_id = ? ORDER BY id DESC LIMIT 1",
+        (dup.txn_id,)).fetchone()["id"]
+    led.conn.execute("UPDATE txn SET review='confirmed_dup' WHERE id=?", (dup_id,))
+    led.conn.commit()
+
+    result = fixups.apply_manual(led, UNMATCHED_A, "订阅服务", apply=True, emit=quiet)
+    check("只改了非重复那 1 笔", result["changed"], 1)
+
+    cats = [r["category"] for r in led.conn.execute(
+        "SELECT category FROM txn WHERE counterparty=? ORDER BY id", (UNMATCHED_A,))]
+    check("非重复那笔改了", cats[0], "订阅服务")
+    check("重复那笔原样不动", cats[1], "未分类")
+
+    # 再跑一次：0 改动。如果没过滤重复，这里会永远是 1，看着像「改不动」。
+    again = fixups.apply_manual(led, UNMATCHED_A, "订阅服务", apply=True, emit=quiet)
+    check("重跑幂等（0 改动）", again["changed"], 0)
+
+
 def case_encrypted_roundtrip() -> None:
-    section("9. 落盘后重新读磁盘核对（加密存储的真实路径）")
+    section("10. 落盘后重新读磁盘核对（加密存储的真实路径）")
     with tempfile.TemporaryDirectory(prefix="mlk-manual-test-") as vault:
         with secure_store.open_encrypted(vault) as led:
             ingest(led, counterparty=UNMATCHED_A, amount="12.30")
@@ -287,6 +312,7 @@ def main() -> int:
     case_apply_manual_scope()
     case_direction_roundtrip()
     case_unmatched_aggregation()
+    case_apply_manual_skips_confirmed_dup()
     case_encrypted_roundtrip()
 
     print()
