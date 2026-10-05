@@ -153,11 +153,18 @@ NEUTRAL_KEYWORDS = (
 )
 
 
-def parse_direction(raw: str, counterparty: str = "", item: str = "") -> str:
+def parse_direction(raw: str, counterparty: str = "", item: str = "",
+                    amount: Optional[Decimal] = None) -> str:
     """把「收/支」列的值转成统一方向。
 
     支付宝用「不计收支」，微信用「中性交易」或留空。
     另外，即使标注为「支出」，充值/提现这类也不算真实消费，归为中性。
+
+    `amount` 是**兜底用的**：实测农行活期明细的 9 列表头里根本没有
+    方向列（没有「借贷标志」也没有「收/支」），只有「交易金额」一列
+    印着 `+2400.00` / `-2400.00`。没有这个参数时那两笔都会落到下面的
+    兜底分支被判成中性 —— 月支出看起来是 0、月收入也是 0，
+    而实际上有 2400 进来过。
     """
     text = normalize_text(raw)
     for key, direction in _DIRECTION_MAP.items():
@@ -166,7 +173,31 @@ def parse_direction(raw: str, counterparty: str = "", item: str = "") -> str:
 
     blob = f"{counterparty}{item}"
     if any(k in blob for k in NEUTRAL_KEYWORDS):
+        # 「转账」在 NEUTRAL_KEYWORDS 里，**但只在金额认不出正负号时才生效**。
+        # 实测踩到的：用户有一笔「转存 +2400.00」（别人转给他，
+        # 他再转进别人账户帮朋友刷业绩），他明确要求这笔**算收入**。
+        # 若这里不看金额直接判中性，月收入就是 0 —— 而钱确实进来了。
+        #
+        # 口径与 `sources._NEUTRAL_SUMMARY_WORDS` 一致：**只压支出侧**。
+        if amount is not None and amount > 0:
+            return DIRECTION_INCOME
         return DIRECTION_NEUTRAL
+
+    # 没有方向列可依据时，用金额正负号兜底。
+    #
+    # 三支都要写全，缺一支就会静默错判：
+    #   正数 → 收入（钱进来了）
+    #   负数 → 支出（钱出去了）   ← 少了这支，普通消费会被判成中性，
+    #                              月支出永远是 0，而报表看不出异常
+    #   无符号/为 0 → 中性（真的认不出来）
+    #
+    # 刻意**不**「默认判支出」：银行流水里绝大多数是支出，
+    # 但「绝大多数」不是「全部」，默认支出等于把收入也吞掉。
+    if amount is not None:
+        if amount > 0:
+            return DIRECTION_INCOME
+        if amount < 0:
+            return DIRECTION_EXPENSE
     return DIRECTION_NEUTRAL
 
 

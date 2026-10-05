@@ -105,4 +105,9 @@ def print_month(ledger, month: str) -> None:
     if income:
         print(f"\n  收入合计 {money(sum(income))} 元")
     if neutral:
-        print(f"  中性交易（充值 / 提现 / 还款等）合计 {money(sum(neutral))} 元，不计入消费")
+        # 「还款」那一项是从支付宝/微信借来的口径；银行流水的「中性」还包括
+        # 代持转账（钱过手，自己既没赚也没花）。用户明确要求那种进账算收入、
+        # 出账不计入支出 —— 出账就落在这里。写清楚有哪些来源，
+        # 别让人以为「中性」全是同一类东西。
+        print(f"  中性交易（转账 / 充值 / 提现 / 账户互转等）合计 "
+              f"{money(sum(neutral))} 元，不计入消费")

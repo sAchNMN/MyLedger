@@ -203,6 +203,24 @@ def _resolve_ts(raw: str):
 # 但这两组数字说不出任何一笔消费。
 # --------------------------------------------------------------------------
 
+def _amount_sign(raw: str) -> str:
+    """金额原文里的正负号：`-` / `+` / `""`（没有或认不出）。
+
+    为什么需要它：`parse_amount` **刻意**返回绝对值
+    （见 `model.Txn.amount` 的注释「金额一律存正的 Decimal」，
+    收支方向单独用 direction 表示）。所以解析完之后符号就没了 ——
+    而没有方向列的表（实测农行活期明细）**只能**靠符号定方向。
+    `+2400.00` 与 `2400.00` 在金额上完全一样，差别只在这个字符上。
+    """
+    text = normalize_text(raw).replace("¥", "").replace("￥", "").replace(",", "")
+    text = text.replace("，", "").strip()
+    if text.startswith("-"):
+        return "-"
+    if text.startswith("+"):
+        return "+"
+    return ""
+
+
 def _row_summary(row: list[str], index: Optional[dict] = None) -> dict:
     summary = {
         "字段数": len(row),
@@ -293,12 +311,20 @@ def _parse_rows(
         counterparty = cell(row, index, "counterparty")
         item = cell(row, index, "item")
         status = cell(row, index, "status")
+        raw_amount_text = cell(row, index, "amount")
+        # 方向列认不出时用金额的正负号兜底，而符号只能从**原文**取 ——
+        # `amount` 是绝对值（见 _amount_sign 的说明）。
+        sign = _amount_sign(raw_amount_text)
+        signed_amount = amount if sign != "-" else -amount
 
         txns.append(Txn(
             source=source,
             ts=ts,
             amount=amount,
-            direction=parse_direction(cell(row, index, "direction"), counterparty, item),
+            # amount 要传进去：没有方向列的表（实测农行活期明细就是）
+            # 只能靠金额正负号定方向，见 parse_direction 的 docstring。
+            direction=parse_direction(cell(row, index, "direction"),
+                                      counterparty, item, signed_amount),
             counterparty=counterparty,
             item=item,
             method=cell(row, index, "method"),
@@ -465,20 +491,29 @@ _EXPENSE_WORDS = ("支出", "转出", "消费", "付款", "扣款", "借")
 
 # 摘要里出现这些词 → 判为「中性」（不是收入也不是消费）
 #
-# 实测踩到的：农行活期明细里账户间转账的摘要就叫「转账」「转存」，
-#   转存 +2400.00   钱从别的账户进这个账户
-#   转账 -2400.00   钱从这个账户出到公积金
-# 这是**把自己的钱换个地方存**，和「充值」「提现」是同一性质。
-# 不判的话月支出会虚高 2400，而报表上看起来完全正常 ——
-# 这是比解析失败更坏的错，因为它不留任何痕迹。
+# 实测踩到的：农行活期明细里「转存 +2400」和「转账 -2400」是
+# **别人转给我、我再转进别人账户**（帮银行工作的朋友刷业绩），
+# 钱过了一手，两边都不是自己的收入或消费。
+#
+# 为什么这里有取舍（用户明确选了「进的那笔算收入」）：
+# 同样的「转账」摘要，数据上分不出三种情况 ——
+#   A. 朋友还款 / 家里给生活费  → 真金白银进来，**该算收入**
+#   B. 代持过账（钱过手）        → 一分钱没赚到，**不该算收入**
+#   C. 自己账户间搬              → 不是收入也不是消费
+# 摘要文字完全一样，从数据上无法区分。所以代码选了 A 的口径
+# （**只压支出侧，收入侧一律保留**，与 `categorize._apply_non_consumption`
+# 同一原则）—— 宁可收入虚高一点，也不要让「借出去的钱」凭空消失。
+# 想改这个行为，用 `setcat` 手工指定即可。
+#
+# 支出侧必须压：-2400 转进公积金账户是「钱换个地方存」，
+# 算成消费会让月支出虚高 2400，而报表看起来完全正常。
 #
 # 与 `model.NEUTRAL_KEYWORDS` 的区别：那份词表是给 `parse_direction` 用的，
 # 而银行链路（这里）自己判方向，所以必须在这里单列一份。
-# 改一处记得同步另一处 —— 或者更该考虑收敛成一份。
 _NEUTRAL_SUMMARY_WORDS = (
     "转账", "转存", "转回", "内部转", "同名转", "父子转",
     "结息", "利息", "罚息", "手续费", "管理费", "年费", "工本费",
-    "现金", "现存", "支取", "冲正", "撤销", "退汇", "汇出", "汇入",
+    "现金", "现存", "支取", "冲正", "撤销", "退汇", "汇出",
     "利息税", "代扣利息",
 )
 
@@ -721,19 +756,35 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
         # 摘要（交易摘要/交易类型那几列）单独拿一份，用来判中性。
         #
         # 为什么要单独拿：`_INCOME_WORDS` / `_EXPENSE_WORDS` 里有「转入」「转出」，
-        # 而**账户间转账的摘要恰恰就叫「转账」「转存」** ——
+        # 而**代持转账的摘要恰恰就叫「转账」「转存」** ——
         # 农行活期明细里这两笔长这样：
-        #     20260928 转存 +2400.00   （钱从别的账户进这个账户）
-        #     20260928 转账 -2400.00   （钱从这个账户出到公积金）
-        # 那是**把自己的钱换个地方存**，不是收入也不是消费。
+        #     20260928 转存 +2400.00   （别人转给我）
+        #     20260928 转账 -2400.00   （我转进对方账户，帮朋友刷业绩）
         # 但 `blob` 里还有「本次余额 2400.04」和「对方信息 XX公积金中心」，
         # 里面可能藏着「存入」「转出」这类词，于是整行被扫成 income/expense。
         #
-        # 后果非常具体：月支出被虚高 2400，而报表上看起来完全正常。
+        # 后果非常具体：支出那笔被判成消费，月支出虚高 2400，
+        # 而报表上看起来完全正常。
         # （`model.NEUTRAL_KEYWORDS` 里本来就有「转账」，但银行链路不走
         #  `parse_direction`，那份中性词表在这条路上完全不生效。）
         summary_blob = "".join(summary_cells)
-        if any(w in summary_blob for w in _NEUTRAL_SUMMARY_WORDS):
+        # 摘要命中「转账/转存/结息」这类词时，**只压支出侧**，收入侧照旧。
+        #
+        # 为什么不对称：同一个「转账」摘要，数据上分不出三种情况 ——
+        #   A. 朋友还款 / 家里给生活费 → 真金白银进来，该算收入
+        #   B. 代持过账（钱过手）      → 一分钱没赚到，不该算收入
+        #   C. 自己账户间搬            → 不是收入也不是消费
+        # 三种在账单上长得一模一样。所以口径选 A：**宁可收入略虚高，
+        # 也不能让「借出去的钱」凭空消失** —— 用户明确选了这个。
+        #
+        # 支出侧必须压：-2400 转进别人账户是「钱换个地方存」，
+        # 算成消费会让月支出虚高 2400，而报表看起来完全正常。
+        #
+        # 与 `categorize._apply_non_consumption` 同一原则（只压支出、保留收入），
+        # 两处保持一致，改一处记得改另一处。
+        is_outflow = (sign in ("-", "")) and any(
+            w in summary_blob for w in _NEUTRAL_SUMMARY_WORDS)
+        if is_outflow:
             direction_hint = DIRECTION_NEUTRAL
         elif any(w in blob for w in _INCOME_WORDS):
             direction_hint = DIRECTION_INCOME
