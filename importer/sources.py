@@ -105,11 +105,24 @@ BANK_OCR_ALIASES = {
 # 这三列（交易名称 / 交易渠道 / 附言）正是判断「钱有没有真花出去、
 # 算不算真消费」的主要依据，走无表头自动识别会把它们全丢掉。
 BANK_PDF_ALIASES = {
+    # 「交易日期」和「交易时间」是**两列**（实测农行活期明细就是这样），
+    # 而 `ts` 只能对应一列。build_index 遍历列在前、先命中先用，
+    # 所以 `ts` 必然落到第 0 列的「交易日期」上，时间被丢掉 ——
+    # 表现是所有交易的时间都变成 00:00:00。
+    # 单独开一个 date 字段拿日期列，时间列交给 `time`，
+    # 下面 _combine_date_time() 把两列拼起来。
+    "date": ("交易日期", "记账日期", "入账日期", "日期"),
+    "time": ("交易时间", "发生时间", "记账时间"),
     "ts": ("交易时间", "交易日期", "记账日期", "入账日期", "日期", "时间"),
     "category_raw": ("交易类型", "摘要", "交易摘要"),
     "counterparty": ("交易对方", "对方名称", "对方户名", "对方账户名",
                      "收款方名称", "付款方名称", "收款方", "付款方",
-                     "商户名称", "对方账号", "商户"),
+                     "商户名称", "对方账号", "商户",
+                     # 实测农行活期明细用的是「对方信息」。
+                     # 别漏：漏了之后交易对方会退回「取最长中文」，
+                     # 于是商户名变成「XX公积金中心」这种可能带机构全称的串，
+                     # 分类规则也就跟着对不上了。
+                     "对方信息", "对方", "交易方", "对方名称及账号"),
     "item": ("交易名称", "摘要", "交易摘要", "用途", "说明"),
     "amount": ("交易金额", "发生额", "金额"),
     "direction": ("收/支", "借贷标志", "借贷方向", "借贷", "收支", "资金去向", "方向"),
@@ -120,11 +133,54 @@ BANK_PDF_ALIASES = {
 }
 
 
+def _combine_date_time(row: list, index: dict) -> Optional[dt.datetime]:
+    """「日期列 + 时间列」合成一个 datetime。缺任一列就只用另一列。
+
+    为什么必须是「分别解析再合并」，不能先拼字符串再整体解析：
+    紧凑写法对整格有硬要求（`_compact_date_parts` 只认**整格 8 位**），
+    拼成 `20260928 205056` 之后整格匹配必然失败。
+    而这个要求不能放松 —— 放松了 19 位卡号就会被切成 8 位日期。
+
+    也没有直接返回拼接字符串再交给 `_resolve_ts`：
+    那条路对「带分隔符的日期 + 冒号时间」有效，对紧凑写法无效。
+    两条路的形态不一样，就该分开处理。
+    """
+    date_text = cell(row, index, "date")
+    time_text = cell(row, index, "time")
+    if not date_text:
+        # 没有独立的日期列（支付宝/微信那种表）→ 走 ts 列整体解析
+        return _resolve_ts(cell(row, index, "ts"))
+
+    base = _resolve_ts(date_text)
+    if base is None:
+        return None
+
+    if not time_text:
+        return base
+    parts = _compact_time_parts(time_text)
+    if parts is None:
+        m = _RE_TIME.match(normalize_text(time_text))
+        if not m:
+            # 时间列认不出来就只用日期 —— 记 00:00:00 比丢掉整笔好
+            return base
+        parts = (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
+    h, mi, s = parts
+    return base.replace(hour=h, minute=mi, second=s, microsecond=0)
+
+
 def _resolve_ts(raw: str):
-    """先按常规格式解析时间，失败再试 Excel 序列号。"""
+    """先按常规格式解析时间，失败再试 Excel 序列号，再失败试紧凑写法。"""
     value = parse_datetime(raw)
     if value is None:
         value = maybe_excel_date(raw)
+    if value is None:
+        # 紧凑写法 YYYYMMDD / YYMMDD（实测农行 PDF 就是这个格式，
+        # 见 `_compact_date_parts` 的注释：同一份账单里还有 10 位账号、
+        # 19 位卡号，所以那里收得很紧）。
+        parts = _compact_date_parts(raw)
+        if parts:
+            y, mo, d = parts
+            value = dt.datetime(y, mo, d)
     return value
 
 
@@ -205,15 +261,27 @@ def _parse_rows(
             continue
 
         amount = parse_amount(cell(row, index, "amount"))
-        if amount is None or amount == 0:
+        if amount is None:
             skipped.append({
                 "row": row_no + 1,
                 "reason_code": "invalid_amount",
                 "field": "amount",
             })
             continue
+        # 金额为 0 的行不是交易，直接跳过且**不记 skipped**。
+        # 实测踩到的：农行活期明细里有
+        #     20260921 结息 +0.00 / 利息税 +0.00
+        # 那是账户计息产生的记账分录，真的一分钱没进出一出。
+        # 记成「解析失败」是冤枉它，还会让每月的失败清单多两条噪声。
+        if amount == 0:
+            continue
 
-        ts = _resolve_ts(cell(row, index, "ts"))
+        # 日期时间分列时（`date` + `time` 两列都有）分别解析再合并，
+        # 否则 `ts` 只会落到其中一列，另一列的信息被丢掉
+        # （实测农行活期明细就是这样印的：`20260928` | `205056`）。
+        # 只有 `ts` 列的表（支付宝/微信）走原样整体解析。
+        ts = (_combine_date_time(row, index) if "date" in index
+              else _resolve_ts(cell(row, index, "ts")))
         if ts is None:
             skipped.append({
                 "row": row_no + 1,
@@ -395,6 +463,25 @@ _RE_HAS_CJK = re.compile(r"[\u4e00-\u9fff]")
 _INCOME_WORDS = ("收入", "转入", "存入", "入账", "退款", "贷")
 _EXPENSE_WORDS = ("支出", "转出", "消费", "付款", "扣款", "借")
 
+# 摘要里出现这些词 → 判为「中性」（不是收入也不是消费）
+#
+# 实测踩到的：农行活期明细里账户间转账的摘要就叫「转账」「转存」，
+#   转存 +2400.00   钱从别的账户进这个账户
+#   转账 -2400.00   钱从这个账户出到公积金
+# 这是**把自己的钱换个地方存**，和「充值」「提现」是同一性质。
+# 不判的话月支出会虚高 2400，而报表上看起来完全正常 ——
+# 这是比解析失败更坏的错，因为它不留任何痕迹。
+#
+# 与 `model.NEUTRAL_KEYWORDS` 的区别：那份词表是给 `parse_direction` 用的，
+# 而银行链路（这里）自己判方向，所以必须在这里单列一份。
+# 改一处记得同步另一处 —— 或者更该考虑收敛成一份。
+_NEUTRAL_SUMMARY_WORDS = (
+    "转账", "转存", "转回", "内部转", "同名转", "父子转",
+    "结息", "利息", "罚息", "手续费", "管理费", "年费", "工本费",
+    "现金", "现存", "支取", "冲正", "撤销", "退汇", "汇出", "汇入",
+    "利息税", "代扣利息",
+)
+
 
 def _skeleton(text: str) -> str:
     r"""把一格文本压成「骨架」：只保留形状，不保留值。
@@ -481,7 +568,14 @@ def _looks_like_summary_row(cells: list) -> bool:
 
 def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
                           origin: str = "", encoding: str = "",
-                          source: str = "bank_ocr") -> ParseResult:
+                          source: str = "bank_ocr",
+                          index: Optional[dict] = None) -> ParseResult:
+    """把二维表解析成 Txn。
+
+    `index` 是「列下标映射」（sniff.build_index 的产物）。给了就**按列取**
+    摘要和对方，没给就退回「按内容猜」。
+    两种模式的差别很大，注释见下面 summary_cells 那一段。
+    """
     from .model import DIRECTION_EXPENSE, DIRECTION_INCOME, DIRECTION_NEUTRAL
 
     now = dt.datetime.now()
@@ -578,9 +672,70 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
                             "field": "amount"})
             continue
 
+        # 金额为 0 的行不是交易。
+        #
+        # 实测踩到的：农行活期明细里有两行
+        #     20260921 结息   +0.00
+        #     20260921 利息税 +0.00
+        # 那是账户计息产生的记账分录，金额就是 0.00（真的没有钱进出）。
+        # 留着它们的后果：月报里多出两笔 0 元交易，笔数不对、分类不对，
+        # 而「交易总笔数」这个数字会被人拿来判断「这个月数据全不全」。
+        #
+        # 表格链路（`_parse_rows`）本来就有 `amount == 0` 的判断，
+        # 银行链路漏了 —— 现在补上，两条路的行为一致。
+        if amount == 0:
+            continue
+
+        # 摘要怎么取：优先按**列**（有表头时），否则按内容猜。
+        #
+        # 为什么不能一直靠猜：农行这份明细里同行的中文列有
+        #     交易摘要=转账 | 对方信息=XX公积金中心 | 交易渠道=掌上银行
+        # 三列都是「短中文」（长度还挨着），按长度/位置挑必然挑错 ——
+        # 实测在「取最长的 ≤12 字」和「取最长的 ≤6 字」两个版本里
+        # 分别挑中了「XX公积金中心」和「掌上银行」，都不是摘要。
+        # 而「算不算真消费」这件事只取决于摘要列（「转账」= 自己的钱挪地方）。
+        #
+        # 有表头时列位置是确定的，没表头时（银行 APP 截图 OCR）
+        # 只能退回猜 —— 那种情况下摘要大概率读不出来，
+        # 于是中性判定失效，方向靠正负号兜底。这是已知的取舍。
+        if index:
+            summary_text = cell(row, index, "category_raw")
+            if not summary_text:
+                summary_text = cell(row, index, "item")
+        else:
+            summary_text = ""
+        if summary_text:
+            summary_cells = [summary_text]
+        else:
+            # 按内容猜：短中文、不是日期、不是金额。
+            # 排序取第一个（不是取最长）—— 「取最长」在多列短中文时必错。
+            cands = [
+                c for c in cells
+                if _RE_HAS_CJK.search(c) and 2 <= len(c) <= 6
+                and not _extract_dates(c) and not _extract_amounts(c)
+            ]
+            summary_cells = cands[:1]
+
         direction_hint = None
         blob = "".join(cells)
-        if any(w in blob for w in _INCOME_WORDS):
+        # 摘要（交易摘要/交易类型那几列）单独拿一份，用来判中性。
+        #
+        # 为什么要单独拿：`_INCOME_WORDS` / `_EXPENSE_WORDS` 里有「转入」「转出」，
+        # 而**账户间转账的摘要恰恰就叫「转账」「转存」** ——
+        # 农行活期明细里这两笔长这样：
+        #     20260928 转存 +2400.00   （钱从别的账户进这个账户）
+        #     20260928 转账 -2400.00   （钱从这个账户出到公积金）
+        # 那是**把自己的钱换个地方存**，不是收入也不是消费。
+        # 但 `blob` 里还有「本次余额 2400.04」和「对方信息 XX公积金中心」，
+        # 里面可能藏着「存入」「转出」这类词，于是整行被扫成 income/expense。
+        #
+        # 后果非常具体：月支出被虚高 2400，而报表上看起来完全正常。
+        # （`model.NEUTRAL_KEYWORDS` 里本来就有「转账」，但银行链路不走
+        #  `parse_direction`，那份中性词表在这条路上完全不生效。）
+        summary_blob = "".join(summary_cells)
+        if any(w in summary_blob for w in _NEUTRAL_SUMMARY_WORDS):
+            direction_hint = DIRECTION_NEUTRAL
+        elif any(w in blob for w in _INCOME_WORDS):
             direction_hint = DIRECTION_INCOME
         elif any(w in blob for w in _EXPENSE_WORDS):
             direction_hint = DIRECTION_EXPENSE
@@ -612,20 +767,25 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
         else:
             direction = DIRECTION_EXPENSE   # 银行流水里绝大多数是支出，负数也归这里
 
-        # 剩下的中文里最长的那个当交易对方。
-        # 刻意「不猜」：宁可留空，也好过把一串流水号或「余额」当成商户名。
-        candidates = [
-            c for c in cells
-            if _RE_HAS_CJK.search(c) and len(c) >= 2
-            and not _extract_dates(c) and not _extract_amounts(c)
-        ]
-        counterparty = max(candidates, key=len) if candidates else ""
+        # 交易对方：同样优先按列取，没表头才按内容猜。
+        # 「猜」的那版刻意取**最长**的中文（不是最短）—— 对方名称一般比
+        # 摘要长，而取错的后果是商户名变成「转账」这种无意义的词。
+        if index:
+            counterparty = cell(row, index, "counterparty")
+        else:
+            candidates = [
+                c for c in cells
+                if _RE_HAS_CJK.search(c) and len(c) >= 2
+                and not _extract_dates(c) and not _extract_amounts(c)
+            ]
+            # 刻意「不猜」：宁可留空，也好过把一串流水号或「余额」当成商户名。
+            counterparty = max(candidates, key=len) if candidates else ""
 
         notes = []
         if multi_amount_note:
             notes.append(multi_amount_note)
         if time_part is None:
-            notes.append("截图未识别到时间，统一记为 00:00:00")
+            notes.append("该行未识别到交易时间，统一记为 00:00:00")
 
         txns.append(Txn(
             source=source,
@@ -633,7 +793,10 @@ def _parse_bank_rows_auto(rows, path: str, default_year: Optional[int] = None,
             amount=amount,
             direction=direction,
             counterparty=counterparty,
-            item="",
+            # item 填「交易摘要」—— 分类规则和「这笔算不算消费」都要看它。
+            # 以前恒为空，于是「转账」「结息」这类词全丢了，
+            # 既没法判中性，报表上也看不出这笔在干什么。
+            item=summary_cells[0] if summary_cells else "",
             method="",
             status="",
             txn_id="",              # 截图里通常没有可用的流水号，靠内容指纹去重
