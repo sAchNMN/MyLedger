@@ -183,6 +183,58 @@ def case_columns_not_guessed():
     check("渠道取对", t.method, "掌上银行")
 
 
+
+def case_amount_not_balance():
+    print("\n[7] 金额列不能落在余额列上（认错不报错、报表也看不出来）")
+    from importer.sniff import build_index, header_names
+    from importer.sources import _fix_amount_vs_balance_column
+
+    h = header_names(["交易日期", "交易时间", "交易摘要", "交易对方",
+                      "交易金额", "账户余额"])
+    # 直接构造「认错了」的 index，而不是指望 build_index 认错 ——
+    # 后者依赖别名表顺序，改一次别名就变，测试会莫名其妙地失效。
+    # 这里要验的是**互斥函数本身**能不能把错的拉回来。
+    wrong = {"amount": 5, "counterparty": 3}     # 5 = 账户余额
+    fixed = _fix_amount_vs_balance_column(wrong, h)
+    check("修正后取回交易金额", h[fixed["amount"]], "交易金额")
+    check("修正后下标变了", fixed["amount"] != wrong["amount"], True)
+    check("其他字段不动", fixed["counterparty"], 3)
+
+    # 余额类列名**绝不能**出现在 amount 的别名里 ——
+    # 靠名字分不清「余额有时是金额列」，所以只能靠互斥校验
+    from importer.sources import BALANCE_COLUMN_NAMES
+    check("余额列名不在 amount 别名里",
+          any(b in n for b in BALANCE_COLUMN_NAMES
+              for n in BANK_PDF_ALIASES["amount"]), False)
+
+    # 表头里只有余额列、没有金额列时，**不要瞎改** ——
+    # 有些表格金额列就叫别的名字，强行换成「唯一像金额的」反而更错
+    only_balance = {"amount": 1}
+    header_only = header_names(["交易日期", "账户余额"])
+    kept = _fix_amount_vs_balance_column(only_balance, header_only)
+    check("只有余额列时保持原样（不瞎猜）", kept["amount"], 1)
+
+    # 认对了的时候不能被改坏
+    h2 = header_names(ROWS[2])
+    i2 = build_index(h2, BANK_PDF_ALIASES)
+    fixed2 = _fix_amount_vs_balance_column(i2, h2)
+    check("本来认对的不会被改", h2[fixed2["amount"]], "交易金额")
+
+
+def case_move_to_done_retry():
+    print("\n[8] 源文件被占用时不能崩整轮（实测崩过）")
+    from importer import monthly
+    # Windows 上刚被 7z 读过的 zip，句柄不立即释放，
+    # 紧接着 shutil.move 抛 WinError 32 → 整轮批处理崩溃，
+    # 而此时前面几十笔已经写进账本并落盘了。
+    import inspect
+    src = inspect.getsource(monthly._move_to_done)
+    check("有重试逻辑", "for attempt in range(5)" in src, True)
+    check("有等待", "time.sleep" in src, True)
+    check("重试用尽后给出可操作提示", "数据已经入库" in src, True)
+    check("提示文件仍在原处", "文件仍在原处" in src, True)
+
+
 def main() -> int:
     print()
     print("=" * 78)
@@ -194,6 +246,8 @@ def main() -> int:
     case_transfer_is_neutral()
     case_no_direction_column()
     case_columns_not_guessed()
+    case_amount_not_balance()
+    case_move_to_done_retry()
 
     print()
     print("=" * 78)

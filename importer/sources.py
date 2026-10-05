@@ -124,13 +124,72 @@ BANK_PDF_ALIASES = {
                      # 分类规则也就跟着对不上了。
                      "对方信息", "对方", "交易方", "对方名称及账号"),
     "item": ("交易名称", "摘要", "交易摘要", "用途", "说明"),
-    "amount": ("交易金额", "发生额", "金额"),
+    "amount": ("交易金额", "发生额", "金额", "交易额"),
+    # 余额列**刻意不在** amount 的别名里。
+    #
+    # 实测踩到的坑（用 scripts/bank-pdf-columns.py 查出来的）：
+    # 一份 6 列表格，表头是
+    #     交易日期 | 交易时间 | 交易摘要 | 交易对方 | 交易金额 | 账户余额
+    # 而 `build_index` 把 amount 认到了**第 4 列（账户余额）**、
+    # counterparty 认到第 3 列 —— 金额和对方**整体错位一列**。
+    # 后果：每一笔的金额都变成「上一笔/下一笔的余额」，
+    # 而报表看起来完全正常（都是两位小数、都不为零）。
+    #
+    # 之所以会错：`build_index` 对每个字段独立匹配「第一个命中的别名」，
+    # 没有任何「这两列互斥」的概念。加「账户余额」进别名只会更糟 ——
+    # 它在某些表格里确实是金额列，在另一些里是余额列，靠名字分不开。
+    # 正确的做法是让 `scripts/bank-pdf-columns.py` 那样把映射打印出来核对，
+    # 以及在解析时做互斥校验（见 `_fix_amount_vs_balance_column`）。
     "direction": ("收/支", "借贷标志", "借贷方向", "借贷", "收支", "资金去向", "方向"),
     "method": ("交易渠道", "渠道", "交易方式", "业务类型"),
     "status": ("交易状态", "状态"),
     "txn_id": ("交易流水号", "银行流水号", "流水号", "交易单号", "凭证号"),
     "note": ("附言", "用途", "备注", "摘要", "交易摘要"),
 }
+
+
+# 余额列的名字。**只用来做互斥校验，绝不当金额用。**
+# 银行流水里「余额」和「发生额」长得几乎一样（都是两位小数），
+# 认错一列的后果是每一笔金额都变成别人的余额，而报表看不出异常。
+BALANCE_COLUMN_NAMES = (
+    "账户余额", "本次余额", "当前余额", "余额", "账户可用余额", "可用余额",
+)
+
+
+def _fix_amount_vs_balance_column(index: dict, header: list) -> dict:
+    """金额列与余额列**必须是不同的列**，认错了就换回来。
+
+    为什么要这一步：`build_index` 对每个字段独立匹配第一个命中的别名，
+    没有互斥概念。而银行流水里「交易金额」和「账户余额」两种列名都存在，
+    一旦匹配顺序不对，金额就会取到余额那一列。
+
+    实测踩到：一份 6 列表格（交易日期|交易时间|交易摘要|交易对方|交易金额|账户余额），
+    amount 被认到余额列（第 4 列），counterparty 认到交易对方（第 3 列）——
+    金额和对方整体错位一列。每笔金额都变成余额，报表却完全正常。
+
+    判据：表头里若同时存在「金额类」和「余额类」的列名，
+    而它们指向同一列，就说明匹配错了，取**另一个**那一列。
+    """
+    if not index or not header:
+        return index
+    amount_pos = index.get("amount")
+    if amount_pos is None or amount_pos >= len(header):
+        return index
+
+    def _is_balance(pos: int) -> bool:
+        name = header[pos]
+        return any(b in name for b in BALANCE_COLUMN_NAMES)
+
+    if not _is_balance(amount_pos):
+        return index
+
+    # amount 落在余额列上了 → 找一列金额类的
+    for pos, name in enumerate(header):
+        if pos == amount_pos:
+            continue
+        if any(k in name for k in ("金额", "发生额", "交易额")) and not _is_balance(pos):
+            return {**index, "amount": pos}
+    return index
 
 
 def _combine_date_time(row: list, index: dict) -> Optional[dt.datetime]:
@@ -251,6 +310,9 @@ def _parse_rows(
 
     header = header_names(rows[header_row])
     index = build_index(header, aliases)
+    # 金额列不能落在余额列上（银行流水里这两种列名都存在，认错不报错、
+    # 报表也看不出来），详见函数注释。
+    index = _fix_amount_vs_balance_column(index, header)
 
     # 必需字段缺失就直接失败，不要产出半成品账单
     missing = [f for f in ("ts", "amount") if f not in index]

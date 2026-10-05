@@ -157,7 +157,22 @@ def _prompt_password(label: str, kind: str = "压缩包") -> Optional[str]:
 
 
 def _move_to_done(path: str, vault: str) -> str:
-    """挪到 _done/。同名时加时间戳，绝不覆盖——覆盖等于丢数据。"""
+    """挪到 _done/。同名时加时间戳，绝不覆盖——覆盖等于丢数据。
+
+    **为什么要重试。** 实测踩到：Windows 上刚被 7z.exe 读过的 zip，
+    进程退出后文件句柄**不会立刻释放**（杀进程/文件系统缓存的延迟），
+    紧接着 `shutil.move` 就抛
+        PermissionError: [WinError 32] 另一个程序正在使用此文件
+    表现是整轮批处理在最后一步崩掉 —— 前面几十笔已经写进账本并落盘了，
+    用户看到的是一个长 traceback，而实际数据是好的。
+    这属于「失败要响亮」的反面：**不该在这里崩**。
+
+    重试策略：最多 5 次，间隔 0.4 / 0.8 / 1.6 / 3.2 秒（合计约 6 秒）。
+    6 秒还锁着就是真有别的程序开着它（编辑器、杀软扫描、文件管理器预览），
+    那时如实报错让人处理，不无限等。
+    """
+    import time
+
     target_dir = done_dir(vault)
     os.makedirs(target_dir, exist_ok=True)
     base = os.path.basename(path)
@@ -165,8 +180,28 @@ def _move_to_done(path: str, vault: str) -> str:
     if os.path.exists(target):
         stem, ext = os.path.splitext(base)
         target = os.path.join(target_dir, f"{stem}.{datetime.now():%Y%m%d-%H%M%S}{ext}")
-    shutil.move(path, target)
-    return target
+
+    last_error: Optional[Exception] = None
+    for attempt in range(5):
+        try:
+            shutil.move(path, target)
+            return target
+        except PermissionError as exc:
+            last_error = exc
+            if attempt == 4:
+                break
+            time.sleep(0.4 * (2 ** attempt))
+
+    # 重试用尽：明确说清是哪一步、文件还在哪、别丢数据
+    raise RuntimeError(
+        f"导入成功了，但把源文件挪进 _done 失败：文件被别的程序占用。\n"
+        f"  文件仍在原处，数据已经入库，不会丢：\n"
+        f"    {path}\n"
+        f"  占用它的程序（文件管理器预览 / 编辑器 / 杀毒扫描）关掉后，"
+        f"把这个文件自己挪到下面这个目录即可：\n"
+        f"    {target_dir}\n"
+        f"  （原始错误：{last_error}）"
+    ) from last_error
 
 
 def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
@@ -376,8 +411,19 @@ def run(vault: str, *, use_ai: bool = False, ignore_power: bool = False,
             elif keep:
                 print("  --keep：文件保留在投递目录。")
             else:
-                moved = _move_to_done(path, vault)
-                print(f"  已移入 {os.path.relpath(moved, box)}")
+                # 挪文件失败**不能中断整轮**。
+                # 实测踩到：Windows 上刚被 7z 读过的 zip 句柄不立即释放，
+                # 整个批处理在这里抛 WinError 32 崩掉 —— 而此时
+                # 前面几十笔已经写进账本并落盘了。用户看到的是长 traceback，
+                # 却看不到「本次成功导入 N 笔」这个真正重要的结论。
+                # 失败要响亮，但**响亮不等于崩**：说清「数据已入库、文件在哪、
+                # 怎么手动挪」，然后继续处理剩下的文件。
+                try:
+                    moved = _move_to_done(path, vault)
+                    print(f"  已移入 {os.path.relpath(moved, box)}")
+                except RuntimeError as exc:
+                    print(f"  ！{exc}")
+                    partial.append((path, "源文件被占用，未能自动挪入 _done"))
             note(path, index, outcome.status, outcome)
 
         # --------------------------------------------------------------
